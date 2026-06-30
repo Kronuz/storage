@@ -37,7 +37,6 @@
 #include "error.hh"              // for error::name, error::description (errno-names lib)
 #include "likely.h"              // for likely, unlikely (vendored)
 #include "storage_fs.h"          // for storage::normalize_path (vendored)
-#include "storage_io.h"          // for storage::DefaultIO (default IO policy)
 #include "strict_stox.hh"        // for strict_stoull (strict-stox lib)
 #include "stringified.hh"        // for stringified (stringified lib)
 
@@ -59,10 +58,21 @@
 // The Storage* classes are defined further down, after compressor_lz4.h has made
 // Error / THROW available.
 
+// IO policy header. Defaults to storage_io.h, which defines storage::DefaultIO (a
+// portable EINTR-safe POSIX layer). A host with an instrumented IO layer points
+// STORAGE_IO_HEADER at its own header, which both declares its policy type and
+// #defines STORAGE_DEFAULT_IO to it (so the include below brings the type into
+// scope before the template default uses it).
+#ifdef STORAGE_IO_HEADER
+#  include STORAGE_IO_HEADER
+#else
+#  include "storage_io.h"
+#endif
+
 // The engine routes every file operation through an injected IO policy (the 4th
-// template parameter). It defaults to storage::DefaultIO, a portable EINTR-safe
-// POSIX layer; a host with an instrumented IO layer overrides the default for
-// all instantiations at once by defining STORAGE_DEFAULT_IO to its policy type.
+// template parameter). It defaults to storage::DefaultIO; a host overrides the
+// default for all instantiations at once via STORAGE_DEFAULT_IO (typically set by
+// the STORAGE_IO_HEADER above).
 #ifndef STORAGE_DEFAULT_IO
 #define STORAGE_DEFAULT_IO ::storage::DefaultIO
 #endif

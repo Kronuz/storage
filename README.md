@@ -66,8 +66,10 @@ through it: `open/close/lseek/read/write/pread/pwrite/fsync/full_fsync/fallocate
 fadvise`. The default, `storage::DefaultIO`, is a clean, portable, EINTR-safe
 POSIX layer. A host with its own instrumented IO (retry policy, error injection,
 metrics) passes its own struct with the same 11 static methods. To override the
-default for *all* instantiations at once, define `STORAGE_DEFAULT_IO` to your
-policy type before including `storage.h`.
+default for *all* instantiations at once, point `STORAGE_IO_HEADER` at a header
+that declares your policy type and `#define`s `STORAGE_DEFAULT_IO` to it (so the
+type is in scope before the template default uses it) — Xapiand does exactly
+this to route every storage IO through its `io.cc`.
 
 **Async-fsync hook (constructor argument).** By default `commit()` fsyncs
 in-thread. Pass a `StorageFsyncFn` (`void(int fd, bool full_fsync)`) to offload

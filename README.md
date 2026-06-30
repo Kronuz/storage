@@ -46,10 +46,15 @@ std::string data = r.read();           // == "a record"
 - **Append-only volumes.** `write()` appends a record and returns its offset;
   `write_file()` appends a file's contents. Volumes grow in `fallocate`d chunks
   and roll at a 32-bit block ceiling.
-- **Transparent compression.** With `STORAGE_COMPRESS`, records over
-  `STORAGE_MIN_COMPRESS_SIZE` are LZ4-compressed; the bin header records whether
-  a given record is compressed, so reads dispatch automatically. (LZ4 only for
-  now; a codec-in-header refactor for zstd/deflate is a planned follow-up.)
+- **Transparent, multi-codec compression.** Records over
+  `STORAGE_MIN_COMPRESS_SIZE` are compressed with the codec the open flags
+  select: `STORAGE_COMPRESS` (LZ4), `STORAGE_COMPRESS_ZSTD` (Zstandard), or
+  `STORAGE_COMPRESS_DEFLATE`. The codec id is stored per-record in the bin
+  header, so reads dispatch automatically and a volume can mix codecs. LZ4 is
+  codec 0, so volumes written before codec-in-header existed keep reading with no
+  migration. See `examples/bench.cc` for a throughput/ratio comparison (on
+  English-like text: zstd ~3.8x at LZ4-class write speed, LZ4 ~1.8x, deflate the
+  best ratio but far slower to write).
 - **Integrity.** Each record can carry an XXH32 footer checksum, validated on
   read (the reference `StorageBinFooter` stores none; supply a footer that does).
   A flipped byte surfaces as `StorageCorruptVolume`.

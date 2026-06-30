@@ -31,21 +31,34 @@ static double secs(clk::time_point a, clk::time_point b) {
 	return std::chrono::duration<double>(b - a).count();
 }
 
-// Blob with `ratio`-ish redundancy: a repeated phrase compresses well, random
-// bytes do not. Use the phrase form so the compressed numbers are meaningful.
+// A blob with realistic, English-like redundancy: words drawn pseudo-randomly
+// from a small dictionary. This compresses like real text (a few x), not like a
+// single repeated phrase (which would give absurd, unrepresentative ratios). The
+// LCG is deterministic so runs are comparable.
 static std::string make_blob(size_t size) {
-	static const char* phrase = "the quick brown fox jumps over the lazy dog. ";
+	static const char* words[] = {
+		"the", "storage", "engine", "writes", "a", "record", "and", "returns",
+		"its", "offset", "compressed", "block", "volume", "header", "footer",
+		"checksum", "codec", "lz4", "zstd", "deflate", "data", "read", "write",
+		"append", "only", "fixed", "size", "aligned", "buffer", "stream",
+	};
+	constexpr size_t nwords = sizeof(words) / sizeof(words[0]);
 	std::string s;
-	s.reserve(size);
-	while (s.size() < size) { s += phrase; }
+	s.reserve(size + 16);
+	uint64_t state = 0x9E3779B97F4A7C15ull;
+	while (s.size() < size) {
+		state = state * 6364136223846793005ull + 1442695040888963407ull;  // LCG
+		s += words[(state >> 33) % nwords];
+		s += ' ';
+	}
 	s.resize(size);
 	return s;
 }
 
 struct Result { double write_mbs; double read_mbs; double ratio; };
 
-static Result run(const std::string& base, const char* vol, size_t blob_size, size_t count, bool compress) {
-	int flags = STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | (compress ? STORAGE_COMPRESS : 0);
+static Result run(const std::string& base, const char* vol, size_t blob_size, size_t count, int codec_flag) {
+	int flags = STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | codec_flag;
 	std::string blob = make_blob(blob_size);
 	std::vector<uint32_t> offsets;
 	offsets.reserve(count);
@@ -91,16 +104,20 @@ int main() {
 	std::printf("%-28s %12s %12s %10s\n", "scenario", "write MB/s", "read MB/s", "ratio");
 	std::printf("%-28s %12s %12s %10s\n", "--------", "---------", "--------", "-----");
 
-	struct Case { const char* name; const char* vol; size_t size; size_t count; bool compress; };
+	struct Case { const char* name; const char* vol; size_t size; size_t count; int codec; };
 	const Case cases[] = {
-		{"small blobs, raw",     "s_raw.0",  256,          50000, false},
-		{"small blobs, lz4",     "s_lz4.0",  256,          50000, true},
-		{"large blobs, raw",     "l_raw.0",  1 << 20,         200, false},
-		{"large blobs, lz4",     "l_lz4.0",  1 << 20,         200, true},
+		{"small blobs, none",    "s_none.0", 256,          50000, 0},
+		{"small blobs, lz4",     "s_lz4.0",  256,          50000, STORAGE_COMPRESS},
+		{"small blobs, zstd",    "s_zstd.0", 256,          50000, STORAGE_COMPRESS_ZSTD},
+		{"small blobs, deflate", "s_defl.0", 256,          50000, STORAGE_COMPRESS_DEFLATE},
+		{"large blobs, none",    "l_none.0", 1 << 20,         200, 0},
+		{"large blobs, lz4",     "l_lz4.0",  1 << 20,         200, STORAGE_COMPRESS},
+		{"large blobs, zstd",    "l_zstd.0", 1 << 20,         200, STORAGE_COMPRESS_ZSTD},
+		{"large blobs, deflate", "l_defl.0", 1 << 20,         200, STORAGE_COMPRESS_DEFLATE},
 	};
 
 	for (const auto& c : cases) {
-		Result r = run(base, c.vol, c.size, c.count, c.compress);
+		Result r = run(base, c.vol, c.size, c.count, c.codec);
 		std::printf("%-28s %12.1f %12.1f %10.2f\n", c.name, r.write_mbs, r.read_mbs, r.ratio);
 	}
 	return 0;

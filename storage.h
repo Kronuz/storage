@@ -33,7 +33,9 @@
 #include <string_view>           // for std::string_view
 #include <unistd.h>
 
-#include "compressor_lz4.h"      // for LZ4CompressFile/Data, LZ4Decompress*, XXH32 (compressors lib)
+#include "compressor_lz4.h"      // for compress_lz4 / decompress_lz4 + XXH32 (compressors lib)
+#include "compressor_zstd.h"     // for compress_zstd / decompress_zstd
+#include "compressor_deflate.h"  // for compress_deflate / decompress_deflate
 #include "error.hh"              // for error::name, error::description (errno-names lib)
 #include "likely.h"              // for likely, unlikely (vendored)
 #include "storage_fs.h"          // for storage::normalize_path (vendored)
@@ -105,11 +107,56 @@ constexpr int STORAGE_CREATE_OR_OPEN   = 0x03;  // Create database if it doesn't
 constexpr int STORAGE_ASYNC_SYNC       = 0x04;  // fsync (or full_fsync) is async
 constexpr int STORAGE_FULL_SYNC        = 0x08;  // Try to ensure changes are really written to disk.
 constexpr int STORAGE_NO_SYNC          = 0x10;  // Don't attempt to ensure changes have hit disk.
-constexpr int STORAGE_COMPRESS         = 0x20;  // Compress data in storage.
+constexpr int STORAGE_COMPRESS         = 0x20;  // Compress data in storage (LZ4 -- the back-compat default).
+constexpr int STORAGE_COMPRESS_ZSTD    = 0x40;  // Compress with Zstandard instead of LZ4.
+constexpr int STORAGE_COMPRESS_DEFLATE = 0x80;  // Compress with Deflate instead of LZ4.
+constexpr int STORAGE_COMPRESS_MASK    = STORAGE_COMPRESS | STORAGE_COMPRESS_ZSTD | STORAGE_COMPRESS_DEFLATE;
 
 constexpr int STORAGE_FLAG_COMPRESSED  = 0x01;
 constexpr int STORAGE_FLAG_DELETED     = 0x02;
 constexpr int STORAGE_FLAG_MASK        = STORAGE_FLAG_COMPRESSED | STORAGE_FLAG_DELETED;
+
+// Per-record codec, stored in the bin-header flags (bits 2-4) when
+// STORAGE_FLAG_COMPRESSED is set. LZ4 is 0 so volumes written before
+// codec-in-header (LZ4 was the only codec then) keep reading as LZ4 with no
+// migration. The mask sits above STORAGE_FLAG_MASK and below the free high bits.
+constexpr uint8_t STORAGE_CODEC_SHIFT   = 2;
+constexpr uint8_t STORAGE_CODEC_MASK    = 0x1C;   // bits 2,3,4
+constexpr uint8_t STORAGE_CODEC_LZ4     = 0;      // back-compat default
+constexpr uint8_t STORAGE_CODEC_ZSTD    = 1;
+constexpr uint8_t STORAGE_CODEC_DEFLATE = 2;
+
+
+// Codec dispatch. The compressors library's one-shot helpers produce the same
+// block framing as its streaming classes, so an LZ4 record written here is
+// byte-identical to one written by the in-tree streaming engine. NONE returns the
+// data unchanged (the caller only compresses when a codec is selected).
+inline std::string storage_compress(uint8_t codec, std::string_view data) {
+	switch (codec) {
+		case STORAGE_CODEC_ZSTD:    return compress_zstd(data);
+		case STORAGE_CODEC_DEFLATE: return compress_deflate(data);
+		case STORAGE_CODEC_LZ4:
+		default:                    return compress_lz4(data);
+	}
+}
+
+inline std::string storage_decompress(uint8_t codec, std::string_view data) {
+	switch (codec) {
+		case STORAGE_CODEC_ZSTD:    return decompress_zstd(data);
+		case STORAGE_CODEC_DEFLATE: return decompress_deflate(data);
+		case STORAGE_CODEC_LZ4:
+		default:                    return decompress_lz4(data);
+	}
+}
+
+// The codec to write a record with, given the open flags; -1 = no compression.
+// The explicit zstd/deflate selectors win over the plain (LZ4) STORAGE_COMPRESS.
+inline int storage_write_codec(int flags) {
+	if (flags & STORAGE_COMPRESS_ZSTD)    { return STORAGE_CODEC_ZSTD; }
+	if (flags & STORAGE_COMPRESS_DEFLATE) { return STORAGE_CODEC_DEFLATE; }
+	if (flags & STORAGE_COMPRESS)         { return STORAGE_CODEC_LZ4; }
+	return -1;
+}
 
 
 
@@ -265,14 +312,11 @@ class Storage {
 
 	size_t bin_size;
 
-	LZ4CompressData cmpData;
-	LZ4CompressData::iterator cmpData_it;
-
-	LZ4CompressFile cmpFile;
-	LZ4CompressFile::iterator cmpFile_it;
-
-	LZ4DecompressFile decFile;
-	LZ4DecompressFile::iterator decFile_it;
+	// Decompressed payload of the bin currently being read, with a serving cursor.
+	// read() decompresses the whole record once (one-shot codec dispatch) and
+	// hands it out in chunks from here. Records are bounded, so this stays small.
+	std::string _record;
+	size_t _record_offset;
 
 	compressors::XXH32_state_t xxh_state;  // stack-resident; canonical XXH32 from the compressors lib
 	uint32_t bin_hash;
@@ -368,6 +412,7 @@ public:
 		  buffer_offset(0),
 		  bin_offset(0),
 		  bin_size(0),
+		  _record_offset(0),
 		  bin_hash(0),
 		  changed(false),
 		  base_path(storage::normalize_path(base_path_, true)) {
@@ -487,9 +532,8 @@ public:
 	void close() {
 		L_CALL("Storage::close()");
 
-		cmpData.close();
-		cmpFile.close();
-		decFile.close();
+		_record.clear();
+		_record_offset = 0;
 
 		if (fd != -1) {
 			if (flags & STORAGE_WRITABLE) {
@@ -544,18 +588,24 @@ public:
 		const char* bin_footer_data = reinterpret_cast<const char*>(&_bin_footer);
 		size_t bin_footer_data_size = sizeof(StorageBinFooter);
 
-		size_t it_size;
-		bool compress = (flags & STORAGE_COMPRESS) && data_size > STORAGE_MIN_COMPRESS_SIZE;
-		if (compress) {
-			_bin_header.init(param, args, 0, STORAGE_FLAG_COMPRESSED);
-			cmpData.reset(data, data_size, STORAGE_MAGIC);
-			cmpData_it = cmpData.begin();
-			it_size = cmpData_it.size();
-			data = cmpData_it->data();
+		// Pick the codec from the open flags and compress the whole record up
+		// front (one-shot). The payload is then a single contiguous buffer for any
+		// codec, and LZ4 bytes are identical to the in-tree streaming engine (same
+		// CompressData blocks), so existing volumes are unaffected. The codec id
+		// rides in the bin-header flags so read() can dispatch on it.
+		std::string compressed;
+		size_t payload_size = data_size;
+		int wcodec = storage_write_codec(flags);
+		if (wcodec >= 0 && data_size > STORAGE_MIN_COMPRESS_SIZE) {
+			compressed = storage_compress(static_cast<uint8_t>(wcodec), std::string_view(data, data_size));
+			data = compressed.data();
+			payload_size = compressed.size();
+			_bin_header.init(param, args, static_cast<uint32_t>(payload_size),
+				static_cast<uint8_t>(STORAGE_FLAG_COMPRESSED | (wcodec << STORAGE_CODEC_SHIFT)));
 		} else {
-			_bin_header.init(param, args, static_cast<uint32_t>(data_size), 0);
-			it_size = data_size;
+			_bin_header.init(param, args, static_cast<uint32_t>(payload_size), 0);
 		}
+		size_t it_size = payload_size;
 
 		char* buffer = buffer_curr;
 		uint32_t tmp_buffer_offset = buffer_offset;
@@ -575,24 +625,17 @@ public:
 
 		while (it_size) {
 			write_bin(&buffer, tmp_buffer_offset, &data, it_size);
-			if (compress && !it_size) {
-				++cmpData_it;
-				data = cmpData_it->data();
-				it_size = cmpData_it.size();
-			}
 			if (tmp_buffer_offset == STORAGE_BLOCK_SIZE) {
 				write_buffer(&buffer, tmp_buffer_offset, block_offset);
 			}
 		}
 
 		while (bin_footer_data_size) {
-			// Update header size in buffer.
-			if (compress) {
-				buffer_header->size = static_cast<uint32_t>(cmpData.size());
-				_bin_footer.init(param, args, cmpData.get_digest());
-			} else {
-				_bin_footer.init(param, args, xxh32_oneshot(orig_data, data_size, STORAGE_MAGIC));
-			}
+			// The footer checksum is XXH32 over the *uncompressed* input (the bin
+			// header already carries the on-disk payload size), so it is identical
+			// for raw and compressed records, and read() validates it after
+			// decompressing.
+			_bin_footer.init(param, args, xxh32_oneshot(orig_data, data_size, STORAGE_MAGIC));
 
 			write_bin(&buffer, tmp_buffer_offset, &bin_footer_data, bin_footer_data_size);
 
@@ -631,153 +674,35 @@ public:
 	uint32_t write_file(std::string_view filename, void* args=nullptr) {
 		L_CALL("Storage::write_file()");
 
-		if unlikely(fd == -1) {
+		// Read the whole file, then store it through write(): one code path, so
+		// codec dispatch and checksums are shared with write() and there is no
+		// second copy of the block-writing machinery. The in-tree engine streamed
+		// here to avoid buffering the file, but the storage use is bounded blobs,
+		// so the buffer is acceptable; a consumer with huge files should chunk
+		// them into multiple write() calls.
+		stringified filename_string(filename);
+		int fd_read = IO::open(filename_string.c_str(), O_RDONLY, 0644);
+		if unlikely(fd_read == -1) {
 			close();
-			L_DEBUG("IO error in {}: Closed storage", repr(path.empty() ? base_path : path));
-			THROW(StorageClosedError, "Closed storage");
+			L_ERR("IO error in {}: Cannot open file: {}", repr(path.empty() ? base_path : path), filename);
+			THROW(StorageIOError, error::description(errno));
 		}
 
-		if ((flags & STORAGE_WRITABLE) == 0) {
-			L_ERR("IO error in {}: Read-only storage", repr(path.empty() ? base_path : path));
-			THROW(StorageIOError, "Read-only storage");
-		}
-
-		uint32_t curr_offset = header.head.offset;
-
-		StorageBinHeader _bin_header;
-		memset(&_bin_header, 0, sizeof(_bin_header));
-		const char* bin_header_data = reinterpret_cast<const char*>(&_bin_header);
-		size_t bin_header_data_size = sizeof(StorageBinHeader);
-
-		StorageBinFooter _bin_footer;
-		memset(&_bin_footer, 0, sizeof(_bin_footer));
-		const char* bin_footer_data = reinterpret_cast<const char*>(&_bin_footer);
-		size_t bin_footer_data_size = sizeof(StorageBinFooter);
-
-		size_t it_size = 0;
-		off_t file_size = 0;
-		int fd_write = -1;
+		std::string contents;
 		char buf_read[STORAGE_BLOCK_SIZE];
-		const char* data;
-
-		bool compress = (flags & STORAGE_COMPRESS);
-		if (compress) {
-			_bin_header.init(param, args, 0, STORAGE_FLAG_COMPRESSED);
-			cmpFile.reset(filename, STORAGE_MAGIC);
-			cmpFile_it = cmpFile.begin();
-			it_size = cmpFile_it.size();
-			data = cmpFile_it->data();
-		} else {
-			stringified filename_string(filename);
-			fd_write = IO::open(filename_string.c_str(), O_RDONLY, 0644);
-			if unlikely(fd_write == -1) {
-				close();
-				L_ERR("IO error in {}: Cannot open file: {}", repr(path.empty() ? base_path : path), filename);
-				THROW(StorageIOError, error::description(errno));
-			}
-			_bin_header.init(param, args, 0, 0);
-			auto read_size = IO::read(fd_write, buf_read, sizeof(buf_read));
-			if unlikely(read_size == -1) {
-				close();
-				L_ERR("IO error in {}: Cannot read file: {}", repr(path.empty() ? base_path : path), filename);
-				THROW(StorageIOError, error::description(errno));
-			}
-			it_size = read_size;
-			data = buf_read;
-			file_size += it_size;
-			compressors::XXH32_reset(&xxh_state, STORAGE_MAGIC);
-			compressors::XXH32_update(&xxh_state, data, it_size);
+		ssize_t read_size;
+		while ((read_size = IO::read(fd_read, buf_read, sizeof(buf_read))) > 0) {
+			contents.append(buf_read, static_cast<size_t>(read_size));
 		}
-
-		char* buffer = buffer_curr;
-		uint32_t tmp_buffer_offset = buffer_offset;
-		StorageBinHeader* buffer_header = reinterpret_cast<StorageBinHeader*>(buffer + tmp_buffer_offset);
-
-		off_t block_offset = ((curr_offset * STORAGE_ALIGNMENT) / STORAGE_BLOCK_SIZE) * STORAGE_BLOCK_SIZE;
-		off_t tmp_block_offset = block_offset;
-
-		while (bin_header_data_size) {
-			write_bin(&buffer, tmp_buffer_offset, &bin_header_data, bin_header_data_size);
-			if (tmp_buffer_offset == STORAGE_BLOCK_SIZE) {
-				write_buffer(&buffer, tmp_buffer_offset, block_offset);
-				continue;
-			}
-			break;
+		if unlikely(read_size == -1) {
+			IO::close(fd_read);
+			close();
+			L_ERR("IO error in {}: Cannot read file: {}", repr(path.empty() ? base_path : path), filename);
+			THROW(StorageIOError, error::description(errno));
 		}
+		IO::close(fd_read);
 
-		while (it_size) {
-			write_bin(&buffer, tmp_buffer_offset, &data, it_size);
-			if (!it_size) {
-				if (compress) {
-					++cmpFile_it;
-					it_size = cmpFile_it.size();
-					data = cmpFile_it->data();
-				} else {
-					auto read_size = IO::read(fd_write, buf_read, sizeof(buf_read));
-					if unlikely(read_size == -1) {
-						close();
-						L_ERR("IO error in {}: Cannot read from file: {}", repr(path.empty() ? base_path : path), filename);
-						THROW(StorageIOError, error::description(errno));
-					}
-					it_size = read_size;
-					data = buf_read;
-					file_size += it_size;
-					compressors::XXH32_update(&xxh_state, data, it_size);
-				}
-			}
-			if (tmp_buffer_offset == STORAGE_BLOCK_SIZE) {
-				write_buffer(&buffer, tmp_buffer_offset, block_offset);
-			}
-		}
-
-		if (!compress) {
-			IO::close(fd_write);
-			fd_write = -1;
-		}
-
-		while (bin_footer_data_size) {
-			// Update header size in buffer.
-			if (compress) {
-				buffer_header->size = static_cast<uint32_t>(cmpFile.size());
-				_bin_footer.init(param, args, cmpFile.get_digest());
-			} else {
-				buffer_header->size = static_cast<uint32_t>(file_size);
-				_bin_footer.init(param, args, compressors::XXH32_digest(&xxh_state));
-			}
-
-			write_bin(&buffer, tmp_buffer_offset, &bin_footer_data, bin_footer_data_size);
-
-			// Align the tmp_buffer_offset to the next storage alignment
-			tmp_buffer_offset = static_cast<uint32_t>(((block_offset + tmp_buffer_offset + STORAGE_ALIGNMENT - 1) / STORAGE_ALIGNMENT) * STORAGE_ALIGNMENT - block_offset);
-			if (tmp_buffer_offset == STORAGE_BLOCK_SIZE) {
-				write_buffer(&buffer, tmp_buffer_offset, block_offset);
-				continue;
-			} else {
-				if unlikely(IO::pwrite(fd, buffer, STORAGE_BLOCK_SIZE, block_offset) != STORAGE_BLOCK_SIZE) {
-					close();
-					L_ERR("IO error in {}: pwrite: {} ({}): {}", repr(path.empty() ? base_path : path), error::name(errno), errno, error::description(errno));
-					THROW(StorageIOError, error::description(errno));
-				}
-				break;
-			}
-		}
-
-		// Write the first used buffer.
-		if (buffer != buffer_curr) {
-			if unlikely(IO::pwrite(fd, buffer_curr, STORAGE_BLOCK_SIZE, tmp_block_offset) != STORAGE_BLOCK_SIZE) {
-				close();
-				L_ERR("IO error in {}: pwrite: {} ({}): {}", repr(path.empty() ? base_path : path), error::name(errno), errno, error::description(errno));
-				THROW(StorageIOError, error::description(errno));
-			}
-			buffer_curr = buffer;
-		}
-
-		buffer_offset = tmp_buffer_offset;
-		header.head.offset += (((sizeof(StorageBinHeader) + buffer_header->size + sizeof(StorageBinFooter)) + STORAGE_ALIGNMENT - 1) / STORAGE_ALIGNMENT);
-
-		changed = true;
-
-		return curr_offset;
+		return write(contents.data(), contents.size(), args);
 	}
 
 	size_t read(char* buf, size_t buf_size, uint32_t limit=-1, void* args=nullptr) {
@@ -807,20 +732,39 @@ public:
 			IO::fadvise(fd, bin_offset, bin_header.size, POSIX_FADV_WILLNEED);
 
 			if (bin_header.flags & STORAGE_FLAG_COMPRESSED) {
-				decFile.reset(fd, -1, bin_header.size, STORAGE_MAGIC);
-				decFile_it = decFile.begin();
+				// Read the whole compressed payload and decompress it once; the
+				// chunks are served from _record below. The codec rides in the
+				// bin-header flags (legacy volumes wrote LZ4 = codec 0).
+				uint8_t codec = (bin_header.flags & STORAGE_CODEC_MASK) >> STORAGE_CODEC_SHIFT;
+				std::string payload;
+				payload.resize(bin_header.size);
+				auto payload_read = IO::read(fd, payload.data(), bin_header.size);
+				if unlikely(payload_read == -1) {
+					close();
+					L_ERR("IO error in {}: read: {} ({}): {}", repr(path.empty() ? base_path : path), error::name(errno), errno, error::description(errno));
+					THROW(StorageIOError, error::description(errno));
+				} else if unlikely(static_cast<size_t>(payload_read) != bin_header.size) {
+					THROW(StorageCorruptVolume, "Incomplete bin data");
+				}
 				bin_offset += bin_header.size;
+				_record = storage_decompress(codec, std::string_view(payload.data(), payload.size()));
+				_record_offset = 0;
 			} else {
 				compressors::XXH32_reset(&xxh_state, STORAGE_MAGIC);
 			}
 		}
 
 		if (bin_header.flags & STORAGE_FLAG_COMPRESSED) {
-			size_t _size = decFile_it.read(buf, buf_size);
-			if (_size) {
-				return _size;
+			size_t avail = _record.size() - _record_offset;
+			if (avail) {
+				size_t n = buf_size < avail ? buf_size : avail;
+				memcpy(buf, _record.data() + _record_offset, n);
+				_record_offset += n;
+				return n;
 			}
-			bin_hash = decFile.get_digest();
+			// Whole record served; the footer checksum is over the decompressed
+			// bytes, which equal the original input.
+			bin_hash = xxh32_oneshot(_record.data(), _record.size(), STORAGE_MAGIC);
 		} else {
 			if (buf_size > bin_header.size - bin_size) {
 				buf_size = bin_header.size - bin_size;

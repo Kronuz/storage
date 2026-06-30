@@ -54,17 +54,27 @@ just read; a mismatch throws `StorageCorruptVolume`.
 
 ## Compression and checksums
 
-LZ4 is the only codec today. The bin header's `STORAGE_FLAG_COMPRESSED` bit marks
-per-record whether the payload is an LZ4 frame, so a volume can mix compressed
-and raw records (records below `STORAGE_MIN_COMPRESS_SIZE` are stored raw even
-with `STORAGE_COMPRESS`). The checksum is XXH32 via the compressors library's
-canonical streaming implementation, which produces the same digests as upstream
-xxHash, so checksums are byte-identical to the in-tree engine.
+The bin header's `STORAGE_FLAG_COMPRESSED` bit marks whether a record's payload is
+compressed, and bits 2-4 hold the **codec id** (LZ4 = 0, ZSTD = 1, DEFLATE = 2).
+The open flags pick the write codec (`STORAGE_COMPRESS` for LZ4,
+`STORAGE_COMPRESS_ZSTD`, `STORAGE_COMPRESS_DEFLATE`); `read()` dispatches on the
+stored id. Because LZ4 is codec 0, a volume written before codec-in-header (whose
+records have the compressed bit set and the codec bits zero) reads back as LZ4
+with no migration, and a single volume can mix codecs and raw records (records
+below `STORAGE_MIN_COMPRESS_SIZE` are stored raw even with a compress flag set).
 
-A planned follow-up replaces the single compressed/raw bit with a **codec byte**
-in the bin header (NONE/DEFLATE/LZ4/ZSTD), so a volume can use any codec the
-compressors library provides while old LZ4 volumes still decode by their existing
-marker.
+Compression goes through the compressors library's one-shot helpers
+(`compress_lz4`/`compress_zstd`/`compress_deflate`), which produce the same block
+framing as its streaming classes. So an LZ4 record written here is byte-identical
+to one the in-tree streaming engine wrote. `write()` compresses the whole record
+up front into one contiguous payload; `read()` reads the payload and decompresses
+it once into a buffer, serving the result in chunks. Records are bounded, so the
+buffering is cheap; it also removes the codec-specific streaming-from-fd classes
+the engine used to need (Zstandard has no such class in the compressors library).
+
+The checksum is XXH32 over the *uncompressed* bytes (the same for a raw or
+compressed record), via the compressors library's canonical XXH32, which matches
+upstream xxHash digests — so checksums are byte-identical to the in-tree engine.
 
 ## Extraction notes (what changed from the in-tree engine)
 

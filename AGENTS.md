@@ -58,8 +58,15 @@ cmake -B build-asan -DCMAKE_CXX_FLAGS="-fsanitize=address -g" && cmake --build b
 cmake -B build-tsan -DCMAKE_CXX_FLAGS="-fsanitize=thread  -g" && cmake --build build-tsan && ./build-tsan/storage_test
 ```
 
-## Planned follow-up
+## Codecs
 
-Codec-in-header: replace the single compressed/raw bit with a codec byte
-(NONE/DEFLATE/LZ4/ZSTD) in the bin header, dispatching over the compressors
-library, with a back-compat decode path for existing LZ4 volumes.
+Codec-in-header is implemented: the bin-header flags carry the compressed bit
+(0x01) and the codec id in bits 2-4 (LZ4 = 0, ZSTD = 1, DEFLATE = 2). Open flags
+pick the write codec (`STORAGE_COMPRESS` / `STORAGE_COMPRESS_ZSTD` /
+`STORAGE_COMPRESS_DEFLATE`); `read()` dispatches on the stored id. LZ4 = 0 keeps
+pre-codec volumes readable. Compression uses the compressors library's one-shot
+helpers (same framing as its streaming classes, so LZ4 is byte-identical to the
+in-tree engine); `write()`/`read()` buffer the whole record rather than streaming
+(records are bounded, and Zstandard has no streaming-from-fd class). `bench.cc`
+compares the codecs. Adding a codec = a constant + two `switch` arms in
+`storage_compress`/`storage_decompress` + an open-flag selector.

@@ -215,6 +215,72 @@ int main() {
 		r.close();
 	}
 
+	// ---- codec-in-header: each codec round-trips, and the codec id is stored ----
+	// Read the flags byte of the first bin (block 1, file offset STORAGE_BLOCK_SIZE;
+	// the reference StorageBinHeader is { uint8_t flags; uint32_t size }).
+	auto first_bin_flags = [](const std::string& path) -> int {
+		FILE* f = std::fopen(path.c_str(), "rb");
+		if (!f) { return -1; }
+		std::fseek(f, STORAGE_BLOCK_SIZE, SEEK_SET);
+		int c = std::fgetc(f);
+		std::fclose(f);
+		return c;
+	};
+	{
+		std::string blob;
+		for (int i = 0; i < 400; ++i) { blob += "codec comparison payload, quite compressible indeed. "; }
+
+		struct CodecCase { const char* vol; int open_flag; uint8_t expect_codec; };
+		const CodecCase codecs[] = {
+			{"cd_lz4.0",     STORAGE_COMPRESS,         STORAGE_CODEC_LZ4},
+			{"cd_zstd.0",    STORAGE_COMPRESS_ZSTD,    STORAGE_CODEC_ZSTD},
+			{"cd_deflate.0", STORAGE_COMPRESS_DEFLATE, STORAGE_CODEC_DEFLATE},
+		};
+		for (const auto& c : codecs) {
+			RefStorage w(base, nullptr);
+			w.open(c.vol, STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | c.open_flag);
+			uint32_t off = w.write(blob);
+			w.commit();
+			w.close();
+
+			// The bin is compressed and tagged with the right codec in its flags.
+			int flags = first_bin_flags(base + c.vol);
+			CHECK(flags != -1);
+			CHECK((flags & STORAGE_FLAG_COMPRESSED) != 0);
+			CHECK(((flags & STORAGE_CODEC_MASK) >> STORAGE_CODEC_SHIFT) == c.expect_codec);
+
+			// And it reads back identically (reader dispatches on the stored codec).
+			RefStorage r(base, nullptr);
+			r.open(c.vol, STORAGE_OPEN);
+			r.seek(off);
+			CHECK(r.read() == blob);
+			r.close();
+		}
+
+		// Back-compat: plain STORAGE_COMPRESS must tag codec 0 (LZ4) so a volume
+		// written before codec-in-header (flags had only bit 0 set) still reads.
+		int lz4_flags = first_bin_flags(base + "cd_lz4.0");
+		CHECK(((lz4_flags & STORAGE_CODEC_MASK) >> STORAGE_CODEC_SHIFT) == 0);
+
+		// The on-disk LZ4 payload must be byte-identical to the lib's one-shot
+		// compress_lz4 (which is what the in-tree streaming engine produced), so
+		// existing volumes are unaffected by the refactor.
+		{
+			std::string expect = compress_lz4(blob);
+			FILE* f = std::fopen((base + "cd_lz4.0").c_str(), "rb");
+			CHECK(f != nullptr);
+			if (f) {
+				// payload starts after the 5-byte bin header at block 1.
+				std::fseek(f, STORAGE_BLOCK_SIZE + static_cast<long>(sizeof(StorageBinHeader)), SEEK_SET);
+				std::string got(expect.size(), '\0');
+				size_t n = std::fread(&got[0], 1, expect.size(), f);
+				std::fclose(f);
+				CHECK(n == expect.size());
+				CHECK(got == expect);
+			}
+		}
+	}
+
 	// ---- concurrency: independent instances on independent volumes ----
 	// The engine carries no shared/static state (the in-tree static fsyncher is
 	// gone, replaced by the per-instance async-fsync hook), so N threads each

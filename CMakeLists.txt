@@ -58,4 +58,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# A runnable benchmark (not a test): ./build/storage_bench
 	add_executable(storage_bench examples/bench.cc)
 	target_link_libraries(storage_bench PRIVATE storage)
+
+	# A realistic usage example that mirrors Xapiand's DataStorage (append-only,
+	# compressed, checksummed WAL). It self-checks and is ALSO registered as a
+	# ctest test, so it catches regressions in the write/commit/reopen/replay
+	# round-trip, the zstd codec, and the header/footer integrity checks.
+	add_executable(storage_toy_wal examples/toy_wal.cc)
+	target_link_libraries(storage_toy_wal PRIVATE storage)
+	add_test(NAME storage_toy_wal COMMAND storage_toy_wal)
 endif()

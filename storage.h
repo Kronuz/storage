@@ -230,6 +230,15 @@ public:
 };
 
 
+// Thrown when a writable open targets a legacy v1 volume. New writes always go to
+// fresh v2 volumes, so a consumer catches this to roll forward to the next volume.
+class StorageLegacyReadOnly : public StorageIOError {
+public:
+	template<typename... Args>
+	StorageLegacyReadOnly(Args&&... args) : StorageIOError(std::forward<Args>(args)...) { }
+};
+
+
 // Async-fsync hook. The engine fsyncs in-thread by default. A host that wants to
 // offload fsync to a batched/background implementation (Xapiand uses a debounced
 // thread pool keyed on the fd) installs one of these via the Storage constructor;
@@ -715,7 +724,7 @@ public:
 				// A v2 consumer may READ a legacy v1 volume, but never write it;
 				// new writes always go to fresh v2 volumes.
 				close();
-				THROW(StorageIOError, "Cannot write a legacy v1 volume");
+				THROW(StorageLegacyReadOnly, "Cannot write a legacy v1 volume");
 			}
 			buffer_offset = hw_offset * STORAGE_ALIGNMENT;
 			size_t offset = (buffer_offset / STORAGE_BLOCK_SIZE) * STORAGE_BLOCK_SIZE;
@@ -886,6 +895,12 @@ public:
 
 		buffer_offset = tmp_buffer_offset;
 		hw_offset += (((sizeof(StorageBinHeader) + buffer_header->size + sizeof(StorageBinFooter)) + STORAGE_ALIGNMENT - 1) / STORAGE_ALIGNMENT);
+		if constexpr (!is_v2) {
+			// v1 consumers (e.g. the WAL) read header.head.offset directly as the
+			// live high-water between commits, so keep it in sync here. v2 keeps the
+			// high-water in the engine-owned meta, written at commit time.
+			header.head.offset = static_cast<uint32_t>(hw_offset);
+		}
 
 		changed = true;
 

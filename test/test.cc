@@ -73,6 +73,28 @@ struct CkBinFooter {
 using RefStorage = Storage<StorageHeader, StorageBinHeader, StorageBinFooter>;
 using CkStorage  = Storage<StorageHeader, StorageBinHeader, CkBinFooter>;
 
+// Backward compatibility: a legacy v1 header (a magic + the required offset, like
+// Xapiand's DataHeaderV1) and a v2 header that shares the same record format. A v2
+// consumer can be given the v1 type as its legacy-header template param so it READS
+// existing v1 volumes (read-only) while writing v2. This mirrors exactly how the
+// Xapiand docstore migrates.
+struct LegacyV1Header {
+	struct Head { uint32_t magic; uint32_t offset; } head;
+	char padding[STORAGE_BLOCK_SIZE - sizeof(Head)];
+	void init(void*, void*) { head.magic = STORAGE_V1_MAGIC; head.offset = STORAGE_START_BLOCK_OFFSET; }
+	void validate(void*, void*) {
+		if (head.magic != STORAGE_V1_MAGIC) { THROW(StorageCorruptVolume, "bad v1 magic"); }
+	}
+};
+struct V2Header {
+	StorageMetaHead meta;
+	char padding[STORAGE_BLOCK_SIZE - sizeof(StorageMetaHead)];
+	void init(void*, void*) { }
+	void validate(void*, void*) { }
+};
+using V1Store        = Storage<LegacyV1Header, StorageBinHeader, CkBinFooter>;                                   // writes v1
+using V2ReadsV1Store = Storage<V2Header, StorageBinHeader, CkBinFooter, STORAGE_DEFAULT_IO, LegacyV1Header>;      // v2, reads v1
+
 
 static std::string make_tmpdir() {
 	char tmpl[] = "/tmp/storage_test.XXXXXX";
@@ -463,6 +485,42 @@ int main() {
 		} catch (const StorageEOF&) {}
 		CHECK(records == 1);   // exactly what was written; the zero tail is not read
 		r.close();
+	}
+
+	// ---- backward compat: a v2 consumer reads an existing v1 volume ----
+	// Write a volume in the legacy v1 format, then open it with a v2 consumer that
+	// lists the v1 header as its legacy type. It must detect v1, read every record,
+	// and REFUSE a writable open (v1 volumes are read-only under v2).
+	{
+		V1Store w(base, nullptr);
+		w.open("legacy.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE);
+		uint32_t oa = w.write("legacy record A");
+		uint32_t ob = w.write(std::string(1200, 'L'));
+		uint32_t oc = w.write("legacy record C");
+		w.commit();
+		w.close();
+
+		V2ReadsV1Store r(base, nullptr);
+		r.open("legacy.0", STORAGE_OPEN);   // detects v1 via the legacy fallback
+		r.seek(oa); CHECK(r.read() == "legacy record A");
+		r.seek(ob); CHECK(r.read() == std::string(1200, 'L'));
+		r.seek(oc); CHECK(r.read() == "legacy record C");
+		r.close();
+
+		// A writable open of a v1 volume by a v2 consumer is refused (roll forward).
+		V2ReadsV1Store w2(base, nullptr);
+		CHECK_THROWS(w2.open("legacy.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE), StorageLegacyReadOnly);
+
+		// A brand-new volume from the v2 consumer is written in v2 and round-trips.
+		V2ReadsV1Store w3(base, nullptr);
+		w3.open("v2new.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE);
+		uint32_t o = w3.write("a v2 record");
+		w3.commit();
+		w3.close();
+		V2ReadsV1Store r3(base, nullptr);
+		r3.open("v2new.0", STORAGE_OPEN);
+		r3.seek(o); CHECK(r3.read() == "a v2 record");
+		r3.close();
 	}
 
 	if (failures == 0) {

@@ -110,13 +110,17 @@ corrupt record:
   neighbours, independently addressed, still read.
 
 **Two on-disk formats: v1 and v2 (crash-safe).** A header type opts a volume into
-**v2** simply by beginning with a `StorageMetaHead meta` (magic `STORAGE_V2_MAGIC`,
+**v2** simply by beginning with a `StorageMetaHead meta` (magic `STORAGE_MAGIC`,
 version, a monotonic `txnid`, the high-water `offset`, and a whole-block
-`checksum`); the `storage_has_meta` trait picks the v2 path with `if constexpr`, so
-a **v1** header (the reference structs, `toy_wal`) keeps the original path
-unchanged. Both formats keep a single header at block 0 and data at block 1; v2 is
-what new Xapiand data volumes use, and the engine still reads existing v1 volumes
-read-only through an optional legacy-header template param.
+`checksum`); the `storage_has_meta` trait picks the v2 path with `if constexpr`.
+v2 is the current format and owns the plain names (`STORAGE_MAGIC`, the reference
+`StorageHeader`); v1 is **legacy**, kept only so old volumes can still be read, and
+its names are underscored to say so (`_LEGACY_STORAGE_MAGIC`, `_LegacyStorageHeader`).
+Both formats keep a single header at block 0 and data at block 1. Legacy support is
+confined to blocks guarded by `STORAGE_LEGACY_SUPPORT` (default 1): define it to 0
+to build a v2-only engine (the legacy header type and the v1 read fallback compile
+out, and every header is then required to be v2), which the `storage_nolegacy` test
+target exercises.
 
 **The v2 commit protocol.** `commit()`:
 

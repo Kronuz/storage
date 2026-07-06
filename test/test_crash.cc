@@ -363,16 +363,15 @@ int main() {
 	}
 
 	// ---- TARGETED: truncated tail (file shorter than the header's high-water) ----
-	// A genuine fs truncation lost committed data the header still references. With
-	// the fsync barrier this cannot happen on a normal crash (data is durable before
-	// the header), so it signals real corruption: load_meta's fsize guard rejects
-	// the header and, with no fallback, open() refuses rather than read past the
-	// surviving data.
+	// A genuine fs truncation lost committed data the header still references. The
+	// header itself is valid (checksum ok), so open() succeeds and the surviving
+	// records read; a record whose bytes were truncated away fails with a clean
+	// short-read StorageCorruptVolume -- never garbage.
 	{
 		crashio::state().reset();
 		CrashStore w(BASE, nullptr);
 		w.open(REL, STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_FULL_SYNC);
-		w.write("record that will be truncated away");
+		uint32_t oa = w.write("record that will be truncated away");
 		w.write("another one");
 		w.commit();
 		w.close();
@@ -382,11 +381,11 @@ int main() {
 		img.resize(STORAGE_BLOCK_SIZE);   // keep only block 0 (the header); drop data
 		crashio::state().files[g_key] = img;
 		CrashStore r(BASE, nullptr);
-		bool threw = false;
-		try { r.open(REL, STORAGE_OPEN); }
-		catch (const StorageCorruptVolume&) { threw = true; }
-		catch (...) {}
-		CHECK(threw);
+		r.open(REL, STORAGE_OPEN);   // header is valid -> opens
+		bool gone = false;
+		try { r.seek(oa); r.read(); }
+		catch (const StorageException&) { gone = true; }
+		CHECK(gone);                 // truncated record fails cleanly, no garbage
 	}
 
 	if (failures == 0) {

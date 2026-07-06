@@ -54,10 +54,9 @@ static void flip_byte(const std::string& path, long pos) {
 }
 
 
-// The default reference structs (the engine's StorageHeader/StorageBinHeader/
-// StorageBinFooter) carry no magic and no checksum. That is the faithful
-// reference format, but it cannot detect corruption, so this suite also defines
-// a checksummed footer to exercise the validate() path.
+// The default reference StorageHeader is now v2 (a checksummed StorageMetaHead);
+// StorageBinHeader/StorageBinFooter carry no per-record magic or checksum, so this
+// suite also defines a checksummed footer to exercise the record validate() path.
 #pragma pack(push, 1)
 struct CkBinFooter {
 	uint32_t checksum;
@@ -70,30 +69,17 @@ struct CkBinFooter {
 };
 #pragma pack(pop)
 
-using RefStorage = Storage<StorageHeader, StorageBinHeader, StorageBinFooter>;
-using CkStorage  = Storage<StorageHeader, StorageBinHeader, CkBinFooter>;
+using RefStorage = Storage<StorageHeader, StorageBinHeader, StorageBinFooter>;   // v2
+using CkStorage  = Storage<StorageHeader, StorageBinHeader, CkBinFooter>;        // v2
 
-// Backward compatibility: a legacy v1 header (a magic + the required offset, like
-// Xapiand's DataHeaderV1) and a v2 header that shares the same record format. A v2
-// consumer can be given the v1 type as its legacy-header template param so it READS
-// existing v1 volumes (read-only) while writing v2. This mirrors exactly how the
-// Xapiand docstore migrates.
-struct LegacyV1Header {
-	struct Head { uint32_t magic; uint32_t offset; } head;
-	char padding[STORAGE_BLOCK_SIZE - sizeof(Head)];
-	void init(void*, void*) { head.magic = STORAGE_V1_MAGIC; head.offset = STORAGE_START_BLOCK_OFFSET; }
-	void validate(void*, void*) {
-		if (head.magic != STORAGE_V1_MAGIC) { THROW(StorageCorruptVolume, "bad v1 magic"); }
-	}
-};
-struct V2Header {
-	StorageMetaHead meta;
-	char padding[STORAGE_BLOCK_SIZE - sizeof(StorageMetaHead)];
-	void init(void*, void*) { }
-	void validate(void*, void*) { }
-};
-using V1Store        = Storage<LegacyV1Header, StorageBinHeader, CkBinFooter>;                                   // writes v1
-using V2ReadsV1Store = Storage<V2Header, StorageBinHeader, CkBinFooter, STORAGE_DEFAULT_IO, LegacyV1Header>;      // v2, reads v1
+#if STORAGE_LEGACY_SUPPORT
+// Backward compatibility: write a legacy v1 volume (the reference _LegacyStorageHeader,
+// which has no meta) and read it back through a v2 consumer that lists the v1 header
+// as its legacy-header template param. Mirrors how the Xapiand docstore migrates.
+// Only built when legacy support is enabled.
+using V1Store        = Storage<_LegacyStorageHeader, StorageBinHeader, CkBinFooter>;                                    // writes v1
+using V2ReadsV1Store = Storage<StorageHeader, StorageBinHeader, CkBinFooter, STORAGE_DEFAULT_IO, _LegacyStorageHeader>; // v2, reads v1
+#endif
 
 
 static std::string make_tmpdir() {
@@ -488,9 +474,11 @@ int main() {
 	}
 
 	// ---- backward compat: a v2 consumer reads an existing v1 volume ----
-	// Write a volume in the legacy v1 format, then open it with a v2 consumer that
-	// lists the v1 header as its legacy type. It must detect v1, read every record,
-	// and REFUSE a writable open (v1 volumes are read-only under v2).
+	// (Only when legacy support is compiled in.) Write a volume in the legacy v1
+	// format, then open it with a v2 consumer that lists the v1 header as its legacy
+	// type. It must detect v1, read every record, and REFUSE a writable open (v1
+	// volumes are read-only under v2).
+#if STORAGE_LEGACY_SUPPORT
 	{
 		V1Store w(base, nullptr);
 		w.open("legacy.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE);
@@ -522,6 +510,7 @@ int main() {
 		r3.seek(o); CHECK(r3.read() == "a v2 record");
 		r3.close();
 	}
+#endif  // STORAGE_LEGACY_SUPPORT
 
 	if (failures == 0) {
 		std::printf("OK: all storage tests passed\n");

@@ -55,8 +55,16 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(storage_test PRIVATE storage)
 	add_test(NAME storage COMMAND storage_test)
 
-	# Crash-consistency + corruption matrix for the v2 dual-meta format, driven
-	# through an in-memory write-logging IO policy (simulated power loss).
+	# The same suite built v2-ONLY (STORAGE_LEGACY_SUPPORT=0): proves the v1 path
+	# compiles out cleanly and the v2 tests still pass without it. The legacy-read
+	# test is #if'd out in this build.
+	add_executable(storage_test_nolegacy test/test.cc)
+	target_link_libraries(storage_test_nolegacy PRIVATE storage)
+	target_compile_definitions(storage_test_nolegacy PRIVATE STORAGE_LEGACY_SUPPORT=0)
+	add_test(NAME storage_nolegacy COMMAND storage_test_nolegacy)
+
+	# Crash-consistency + corruption matrix for the v2 format, driven through an
+	# in-memory write-logging IO policy (simulated power loss).
 	add_executable(storage_test_crash test/test_crash.cc)
 	target_link_libraries(storage_test_crash PRIVATE storage)
 	add_test(NAME storage_crash COMMAND storage_test_crash)

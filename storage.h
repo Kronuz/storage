@@ -84,20 +84,29 @@
 #endif
 
 
-// Volume header magic. STORAGE_V1_MAGIC identifies the legacy single-header format
-// (one in-place header block at offset 0); STORAGE_V2_MAGIC identifies the v2
-// dual-meta format (two alternating, checksummed meta blocks -- see StorageMetaHead).
-// The value 0x02DEBC47 is unchanged from the original STORAGE_MAGIC, so existing v1
-// volumes and record checksums (which seed XXH32 with it) stay byte-compatible.
-#define STORAGE_V1_MAGIC 0x02DEBC47
-#define STORAGE_V2_MAGIC 0x584B5632  // "2VKX" on little-endian disk; Xapiand/Kronuz v2
+// Enable reading legacy v1 volumes. On by default; define it to 0 to build a
+// v2-only engine (the legacy header type and the v1 read fallback are compiled
+// out, and every Storage<> header is then required to be v2). Existing v1 support
+// is confined to the blocks guarded by this macro, so it is also easy to delete.
+#ifndef STORAGE_LEGACY_SUPPORT
+#define STORAGE_LEGACY_SUPPORT 1
+#endif
+
+// Volume header magic. STORAGE_MAGIC identifies the current (v2) format: a single
+// checksummed header (StorageMetaHead) at block 0, crash-safe by sector atomicity.
+// _LEGACY_STORAGE_MAGIC identifies the legacy v1 format (a bare offset header, no
+// checksum), kept only so old volumes can still be read. Its value is unchanged
+// from the original magic, so existing v1 volumes and record checksums (which seed
+// XXH32 with it) stay byte-compatible.
+#define _LEGACY_STORAGE_MAGIC 0x02DEBC47
+#define STORAGE_MAGIC 0x584B5632  // "2VKX" on little-endian disk; Xapiand/Kronuz v2
 #define STORAGE_BIN_HEADER_MAGIC 0x2A
 #define STORAGE_BIN_FOOTER_MAGIC 0x42
 
-// The seed for record footer checksums. A fixed constant (the v1 magic value) shared
-// by v1 and v2 records, which are byte-identical, so a record written under either
-// format validates the same way.
-#define STORAGE_CHECKSUM_SEED STORAGE_V1_MAGIC
+// The seed for record footer checksums: a fixed constant shared by v1 and v2
+// records, which are byte-identical, so a record written under either format
+// validates the same way.
+#define STORAGE_CHECKSUM_SEED _LEGACY_STORAGE_MAGIC
 
 #define STORAGE_BLOCK_SIZE (1024 * 4)
 #define STORAGE_ALIGNMENT 8
@@ -267,7 +276,7 @@ using StorageFsyncFn = std::function<void(int fd, bool full_fsync)>;
 // `txnid` is a monotonic commit counter (informational / debugging).
 #pragma pack(push, 1)
 struct StorageMetaHead {
-	uint32_t magic;      // STORAGE_V2_MAGIC (identifies a v2 header)
+	uint32_t magic;      // STORAGE_MAGIC (identifies a v2 header)
 	uint16_t version;    // meta format version (currently 2)
 	uint16_t reserved;   // reserved for flags; zero for now
 	uint64_t txnid;      // monotonic commit counter
@@ -290,30 +299,48 @@ template <typename T>
 inline constexpr bool storage_has_meta_v = storage_has_meta<T>::value;
 
 
+// ===========================================================================
+// Reference header structs.
+//
+// RECOMMENDED (v2): a header that begins with a StorageMetaHead opts the volume
+// into the crash-safe v2 format -- magic + version + checksum + the data->header
+// fsync barrier in commit(). Real consumers add their own fields (uuid, revision,
+// ...) after the meta; StorageHeader is the minimal ready-made one.
+// ===========================================================================
 struct StorageHeader {
+	StorageMetaHead meta;
+	char padding[STORAGE_BLOCK_SIZE - sizeof(StorageMetaHead)];
+
+	void init(void* /*param*/, void* /*args*/) { }      // the engine stamps meta
+	void validate(void* /*param*/, void* /*args*/) { }  // the engine validates meta
+};
+static_assert(sizeof(StorageHeader) == STORAGE_BLOCK_SIZE, "v2 header must be one block");
+
+
+// ---- LEGACY v1 -- do not use for new volumes ------------------------------
+// _LegacyStorageHeader is the legacy single-header format: a bare high-water offset
+// with NO magic and NO checksum, so it cannot detect a corrupt or torn header.
+// It is kept ONLY so a v2-capable consumer can still READ pre-existing v1 volumes
+// (pass it as the Storage<> `StorageLegacyHeader` template param). New volumes
+// must use a StorageMetaHead-prefixed header (see StorageHeader above); v1
+// support may be dropped in a future version, and can be compiled out today by
+// defining STORAGE_LEGACY_SUPPORT to 0.
+// ---------------------------------------------------------------------------
+#if STORAGE_LEGACY_SUPPORT
+struct _LegacyStorageHeader {
 	struct StorageHeaderHead {
-		// uint32_t magic;
-		uint32_t offset;  // required
-		// char uuid[36];
+		uint32_t offset;  // required (the high-water mark)
 	} head;
 
-	char padding[(STORAGE_BLOCK_SIZE - sizeof(StorageHeader::StorageHeaderHead)) / sizeof(char)];
+	char padding[(STORAGE_BLOCK_SIZE - sizeof(_LegacyStorageHeader::StorageHeaderHead)) / sizeof(char)];
 
 	void init(void* /*param*/, void* /*args*/) {
 		head.offset = STORAGE_START_BLOCK_OFFSET;
-		// head.magic = STORAGE_MAGIC;
-		// strncpy(head.uuid, "00000000-0000-0000-0000-000000000000", sizeof(head.uuid));
 	}
 
-	void validate(void* /*param*/, void* /*args*/) {
-		// if (head.magic != STORAGE_MAGIC) {
-		// 	THROW(StorageCorruptVolume, "Bad header magic number");
-		// }
-		// if (strncasecmp(head.uuid, "00000000-0000-0000-0000-000000000000", sizeof(head.uuid))) {
-		// 	THROW(StorageCorruptVolume, "UUID mismatch");
-		// }
-	}
+	void validate(void* /*param*/, void* /*args*/) { }
 };
+#endif  // STORAGE_LEGACY_SUPPORT
 
 
 #pragma pack(push, 1)
@@ -413,6 +440,10 @@ class Storage {
 
 	// True iff this consumer's header opts into the v2 (magic + checksum) format.
 	static constexpr bool is_v2 = storage_has_meta_v<StorageHeader>;
+#if !STORAGE_LEGACY_SUPPORT
+	static_assert(is_v2, "STORAGE_LEGACY_SUPPORT is off: the storage header must be v2 "
+		"(begin with a StorageMetaHead); the v1 path is compiled out");
+#endif
 
 	// XXH32 over the whole header block with the 4-byte checksum field treated as
 	// zero (so the checksum can live inside the block it protects). v2-only.
@@ -425,7 +456,7 @@ class Storage {
 	// Stamp the in-memory header's meta (consumer fields already populated) with the
 	// next txnid + current high-water, checksum it, and rewrite block 0. v2-only.
 	void write_meta() {
-		header.meta.magic = STORAGE_V2_MAGIC;
+		header.meta.magic = STORAGE_MAGIC;
 		header.meta.version = StorageMetaHead::CURRENT_VERSION;
 		header.meta.reserved = 0;
 		header.meta.txnid = ++meta_txnid;
@@ -638,15 +669,14 @@ public:
 	}
 
 	// Read the header at block 0 into `out` and return true iff it is a valid v2
-	// header: full read, correct magic, a version we understand, a matching
-	// whole-block checksum, and a high-water that fits within the physical file (a
-	// truncated tail makes it invalid). v2-only.
+	// header: full read, correct magic, a version we understand, and a matching
+	// whole-block checksum. v2-only.
 	bool load_meta(StorageHeader& out) {
 		auto n = IO::pread(fd, &out, sizeof(out), 0);
 		if (n != static_cast<ssize_t>(sizeof(out))) {
 			return false;
 		}
-		if (out.meta.magic != STORAGE_V2_MAGIC) {
+		if (out.meta.magic != STORAGE_MAGIC) {
 			return false;
 		}
 		if (out.meta.version > StorageMetaHead::CURRENT_VERSION) {
@@ -656,10 +686,9 @@ public:
 		if (meta_checksum(out) != stored) {
 			return false;  // bit-rotted (or, for a header that spans sectors, torn)
 		}
-		off_t fsize = IO::lseek(fd, 0, SEEK_END);
-		if (fsize != -1 && static_cast<uint64_t>(out.meta.offset) * STORAGE_ALIGNMENT > static_cast<uint64_t>(fsize)) {
-			return false;  // high-water beyond EOF (truncated tail): distrust it
-		}
+		// A high-water past EOF (a truncated tail) is left to the read path: the
+		// header opens, the surviving prefix reads, and a record past EOF fails
+		// with a clean short-read StorageCorruptVolume -- the same as v1.
 		return true;
 	}
 
@@ -683,7 +712,9 @@ public:
 				hw_offset = header.meta.offset;
 				vol_format = 2;
 				header.validate(param, args);
-			} else if constexpr (!std::is_void_v<StorageLegacyHeader>) {
+			}
+#if STORAGE_LEGACY_SUPPORT
+			else if constexpr (!std::is_void_v<StorageLegacyHeader>) {
 				// Not a v2 volume: fall back to reading the legacy v1 header
 				// (read-only). Throws if it is not a valid v1 volume either.
 				StorageLegacyHeader legacy;
@@ -694,7 +725,9 @@ public:
 				legacy.validate(param, args);
 				hw_offset = legacy.head.offset;
 				vol_format = 1;
-			} else {
+			}
+#endif  // STORAGE_LEGACY_SUPPORT
+			else {
 				THROW(StorageCorruptVolume, "No valid v2 header");
 			}
 		} else {

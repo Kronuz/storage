@@ -24,6 +24,34 @@ static int failures = 0;
 		try { stmt; } catch (const exc&) { _threw = true; } catch (...) {} \
 		if (!_threw) { std::printf("FAIL %s:%d: expected %s from: %s\n", __FILE__, __LINE__, #exc, #stmt); ++failures; } \
 	} while (0)
+// Like CHECK_THROWS, but also asserts the exception message contains `substr`.
+// Used to distinguish *which* corruption path fired (e.g. the size-bounds guard
+// vs. a downstream short read) without depending on allocation magnitude.
+#define CHECK_THROWS_MSG(stmt, exc, substr) do { \
+		bool _ok = false; \
+		try { stmt; } \
+		catch (const exc& _e) { _ok = std::string(_e.what()).find(substr) != std::string::npos; } \
+		catch (...) {} \
+		if (!_ok) { std::printf("FAIL %s:%d: expected %s containing \"%s\" from: %s\n", __FILE__, __LINE__, #exc, substr, #stmt); ++failures; } \
+	} while (0)
+
+
+// Truncate a volume file to `len` bytes (simulates a torn write / power loss
+// that left the tail unwritten). Returns true on success.
+static bool truncate_file(const std::string& path, off_t len) {
+	return ::truncate(path.c_str(), len) == 0;
+}
+
+// Flip one byte at `pos` in a file (simulates bit rot / a scribble).
+static void flip_byte(const std::string& path, long pos) {
+	FILE* f = std::fopen(path.c_str(), "r+b");
+	if (!f) { return; }
+	std::fseek(f, pos, SEEK_SET);
+	int ch = std::fgetc(f);
+	std::fseek(f, pos, SEEK_SET);
+	std::fputc(ch ^ 0xFF, f);
+	std::fclose(f);
+}
 
 
 // The default reference structs (the engine's StorageHeader/StorageBinHeader/
@@ -313,6 +341,128 @@ int main() {
 		}
 		for (auto& th : threads) { th.join(); }
 		CHECK(ok.load() == N);
+	}
+
+	// ==================================================================
+	// Fault injection: "what if things go really bad" -- torn writes,
+	// truncation, bit rot, a corrupt size field. The contract for an
+	// append-only store: damage to the tail (or to one record) must be
+	// DETECTED (a Storage* exception, never a crash / OOM / silent garbage),
+	// and every record committed BEFORE the damage must remain readable.
+	// ==================================================================
+
+	// ---- corrupt size field is rejected by the bounds guard, no giant alloc ----
+	// A flipped byte in the (unchecksummed) bin header's size field must not drive
+	// an unbounded allocation on the compressed read path. The guard rejects it as
+	// StorageCorruptVolume *before* payload.resize(), so a 0xFFFFFFFF size costs
+	// nothing instead of attempting ~4 GB.
+	{
+		std::string data;
+		for (int i = 0; i < 500; ++i) { data += "compressible size-guard payload, repeated. "; }
+
+		CkStorage w(base, nullptr);
+		w.open("sz.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS);
+		uint32_t off = w.write(data);
+		w.commit();
+		w.close();
+
+		// Reference/Ck bin header is packed { uint8_t flags; uint32_t size }; the
+		// first bin sits at block 1, so the size field is at STORAGE_BLOCK_SIZE + 1.
+		// Overwrite it with a value far larger than the whole volume, leaving the
+		// COMPRESSED flag byte intact so read() still takes the resize() path.
+		std::string path = base + "sz.0";
+		FILE* f = std::fopen(path.c_str(), "r+b");
+		CHECK(f != nullptr);
+		if (f) {
+			uint32_t huge = 0xFFFFFFFFu;
+			std::fseek(f, STORAGE_BLOCK_SIZE + 1, SEEK_SET);
+			std::fwrite(&huge, sizeof(huge), 1, f);
+			std::fclose(f);
+		}
+
+		CkStorage r(base, nullptr);
+		r.open("sz.0", STORAGE_OPEN);
+		r.seek(off);
+		CHECK_THROWS_MSG(r.read(), StorageCorruptVolume, "bounds");
+		r.close();
+	}
+
+	// ---- torn write (truncation): damaged record is caught, prefix survives ----
+	// Three records; truncate the file inside the third. Reading the first two
+	// still works (append-only isolates them); reading the third fails cleanly
+	// with a short-read StorageCorruptVolume, not a crash or garbage.
+	{
+		std::string a(1500, 'a'), b(1500, 'b'), c(1500, 'c');
+		CkStorage w(base, nullptr);
+		w.open("torn.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE);  // uncompressed
+		uint32_t oa = w.write(a);
+		uint32_t ob = w.write(b);
+		uint32_t oc = w.write(c);
+		w.commit();
+		w.close();
+
+		std::string path = base + "torn.0";
+		// Truncate deterministically INTO record c's payload -- relative to c's own
+		// offset, not the physical file end (growfile() preallocates a zeroed tail,
+		// so cutting from the end would only trim zeros and leave c intact). c's
+		// bytes start at oc*STORAGE_ALIGNMENT; skip its bin header, then keep ~700
+		// of the 1500 payload bytes so the record is genuinely torn.
+		off_t c_payload = static_cast<off_t>(oc) * STORAGE_ALIGNMENT + sizeof(StorageBinHeader);
+		CHECK(truncate_file(path, c_payload + 700));
+
+		CkStorage r(base, nullptr);
+		r.open("torn.0", STORAGE_OPEN);
+		r.seek(oa); CHECK(r.read() == a);   // committed before the tear -> intact
+		r.seek(ob); CHECK(r.read() == b);   // committed before the tear -> intact
+		r.seek(oc); CHECK_THROWS(r.read(), StorageCorruptVolume);  // torn -> caught
+		r.close();
+	}
+
+	// ---- bit rot in a middle record is isolated to that record ----
+	// Corrupting one record's payload trips its footer checksum, but its
+	// neighbours (independently addressed and checksummed) still read back.
+	{
+		std::string a(1500, 'p'), b(1500, 'q'), c(1500, 'r');
+		CkStorage w(base, nullptr);
+		w.open("rot.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE);  // uncompressed
+		uint32_t oa = w.write(a);
+		uint32_t ob = w.write(b);
+		uint32_t oc = w.write(c);
+		w.commit();
+		w.close();
+
+		// Flip a byte inside record b's payload (b starts at ob*STORAGE_ALIGNMENT,
+		// then its bin header, so +64 lands in the payload).
+		flip_byte(base + "rot.0", static_cast<long>(ob) * STORAGE_ALIGNMENT + sizeof(StorageBinHeader) + 64);
+
+		CkStorage r(base, nullptr);
+		r.open("rot.0", STORAGE_OPEN);
+		r.seek(oa); CHECK(r.read() == a);   // untouched neighbour
+		r.seek(ob); CHECK_THROWS(r.read(), StorageCorruptVolume);  // rotted record
+		r.seek(oc); CHECK(r.read() == c);   // untouched neighbour
+		r.close();
+	}
+
+	// ---- the committed high-water mark bounds reads (no phantom zero records) ----
+	// growfile() preallocates zeroed blocks past head.offset. A sequential read
+	// must stop at StorageEOF exactly at the committed boundary and never mistake
+	// the zero tail for empty records.
+	{
+		RefStorage w(base, nullptr);
+		w.open("hw.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE);
+		w.write("only record");
+		w.commit();
+		w.close();
+
+		RefStorage r(base, nullptr);
+		r.open("hw.0", STORAGE_OPEN);
+		r.seek(STORAGE_START_BLOCK_OFFSET);
+		int records = 0;
+		try {
+			while (true) { r.read(); ++records; }
+		} catch (const StorageEOF&) {}
+		CHECK(records == 1);   // exactly what was written; the zero tail is not read
+		r.close();
 	}
 
 	if (failures == 0) {

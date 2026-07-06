@@ -559,6 +559,19 @@ public:
 			THROW(StorageEOF, "Storage EOF");
 		}
 		bin_offset = offset * STORAGE_ALIGNMENT;
+
+		// Reset the per-record read state so seek() is always a clean entry point.
+		// read() carries state across calls while streaming one record in chunks
+		// (bin_header.size != 0 means "mid record"); if a prior read stopped early
+		// -- an exception on a corrupt/torn record, or a partial char* read the
+		// caller never drained -- that stale state would otherwise make the read at
+		// the new offset reinterpret the next record with the previous header,
+		// yielding a spurious checksum failure or silent garbage. A seek is always
+		// the start of a fresh record, so clear it.
+		bin_header.size = 0;
+		bin_size = 0;
+		_record.clear();
+		_record_offset = 0;
 	}
 
 	uint32_t write(const char *data, size_t data_size, void* args=nullptr) {
@@ -728,6 +741,23 @@ public:
 			}
 			bin_offset += read_size;
 			bin_header.validate(param, args);
+
+			// Guard the size field before trusting it for I/O or allocation. A
+			// record's payload plus its footer can never extend past the volume's
+			// committed high-water mark (header.head.offset, counted in
+			// STORAGE_ALIGNMENT units -- the same bound seek()/EOF use). The bin
+			// header is not checksummed, so a single flipped byte can turn `size`
+			// into ~4 GB; without this check the payload.resize(size) on the
+			// compressed path below would attempt a multi-gigabyte allocation,
+			// turning a corrupt volume into an OOM / std::bad_alloc instead of a
+			// clean, catchable StorageCorruptVolume. The bound also caps the
+			// uncompressed read loop. It is computed from in-memory state (zero
+			// syscalls) and never rejects a valid record (head.offset is always
+			// rounded up past the last committed footer).
+			if (static_cast<uint64_t>(bin_offset) + bin_header.size + sizeof(StorageBinFooter)
+					> static_cast<uint64_t>(header.head.offset) * STORAGE_ALIGNMENT) {
+				THROW(StorageCorruptVolume, "Bin size exceeds volume bounds");
+			}
 
 			IO::fadvise(fd, bin_offset, bin_header.size, POSIX_FADV_WILLNEED);
 

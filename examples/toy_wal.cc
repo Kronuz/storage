@@ -39,8 +39,9 @@ static int failures = 0;
 
 
 // Magic'd header + a footer that actually keeps a checksum, mirroring how
-// Xapiand's DataStorage detects corrupt volumes (shard.cc's DataHeader /
-// DataBinHeader / DataBinFooter carry STORAGE_MAGIC and the DELETED flag).
+// Xapiand's DataStorage detects corrupt volumes (shard.cc's DataBinHeader /
+// DataBinFooter carry STORAGE_BIN_HEADER_MAGIC / STORAGE_BIN_FOOTER_MAGIC and the
+// DELETED flag; its header now uses the crash-safe v2 meta).
 constexpr uint32_t TOY_WAL_MAGIC    = 0x57414C21;  // "WAL!"
 constexpr uint8_t  TOY_BIN_MAGIC    = 0xB1;
 constexpr uint8_t  TOY_FOOTER_MAGIC = 0xF0;

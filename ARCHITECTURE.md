@@ -8,29 +8,33 @@ that follow, each aligned to `STORAGE_ALIGNMENT` (8 bytes).
 ## On-disk layout
 
 ```
-volume file
-+------------------+  block 0
-|     Header       |   head.offset = next free position (in 8-byte units)
-+------------------+  block 1 .. N
-|  BinHeader       |   per record: flags + size
-|  payload         |   raw bytes, or an LZ4 frame if STORAGE_FLAG_COMPRESSED
-|  Footer          |   optional XXH32 checksum
-|  (alignment pad) |
-|  BinHeader ...   |   next record
-+------------------+
+volume file (v1)                     volume file (v2, dual-meta)
++------------------+  block 0        +------------------+  block 0  meta A
+|     Header       |                 |  StorageMetaHead |   magic|version|txnid|
++------------------+  block 1 .. N   |  + consumer head |   offset|checksum ...
+|  BinHeader       |   per record    +------------------+  block 1  meta B
+|  payload         |                 |  StorageMetaHead |   (alternated per commit)
+|  Footer          |                 +------------------+  block 2 .. N
+|  (alignment pad) |                 |  BinHeader/payload|   records (same framing)
+|  BinHeader ...   |                 |  Footer ...       |
++------------------+                 +------------------+
 ```
 
 A record's **offset** (what `write()` returns and `read()`/`seek()` take) is its
 position in 8-byte alignment units, so a 32-bit offset addresses up to 32 GiB per
-volume. `head.offset` in the volume header is the running append cursor;
-`commit()` writes it back to block 0 and fsyncs.
+volume. The **high-water mark** is the running append cursor: in v1 it lives in
+the header's `head.offset`, written back to block 0 by `commit()`; in v2 it lives
+in the meta's `offset`, written to the alternate meta block under a fsync barrier
+(see "Durability and failure modes"). The engine tracks it in one place
+(`hw_offset`) for both formats.
 
 `Header`, `BinHeader`, and `Footer` are **template parameters**, not fixed
 structs. The engine only calls their `init()` / `validate()` hooks, so a consumer
 controls the exact framing: the reference structs in `storage.h` are minimal
 (offset-only header, `flags`+`size` bin header, empty footer), while Xapiand's
-WAL and data stores supply richer ones with magic numbers and XXH32 checksums.
-That is how the same engine backs different on-disk formats.
+WAL and data stores supply richer ones with magic numbers and XXH32 checksums. A
+header that begins with a `StorageMetaHead meta` also opts the volume into the
+crash-safe v2 format. That is how the same engine backs different on-disk formats.
 
 ## The write path
 
@@ -90,9 +94,8 @@ corrupt record:
 
 - A short read of the header, payload, or footer (a truncated tail from a torn
   write or power loss) throws `StorageCorruptVolume` (`Incomplete bin ...`).
-- Reads are bounded by the committed high-water mark (`header.head.offset`), so a
-  preallocated or power-loss zero tail past that mark is `StorageEOF`, not a
-  phantom empty record.
+- Reads are bounded by the committed high-water mark, so a preallocated or
+  power-loss zero tail past that mark is `StorageEOF`, not a phantom empty record.
 - The size field is validated against that same high-water mark before it is
   trusted for I/O or allocation, so a garbled size (the bin header is not
   checksummed, and one flipped byte can turn it into ~4 GB) is a clean
@@ -104,44 +107,62 @@ corrupt record:
   record trips `StorageCorruptVolume` and is isolated to that record; its
   neighbours, independently addressed, still read.
 
-**Integrity is opt-in, and off by default.** The reference `StorageHeader`,
-`StorageBinHeader`, and `StorageBinFooter` carry **no magic and no checksum** (the
-fields are present but commented out). They are the faithful on-disk reference,
-but a consumer that uses them as-is runs with no corruption detection, and a torn
-tail can read back as silent garbage. A consumer that wants the guarantees above
-must supply header/footer types that carry a magic and a footer checksum. Xapiand
-does (`WalBinHeader`/`WalBinFooter` carry `STORAGE_BIN_HEADER_MAGIC` +
-`STORAGE_BIN_FOOTER_MAGIC` + XXH32), so real WAL and docstore records are
-protected; its replay recovers the good prefix and quarantines a corrupt volume
-rather than deleting it.
+**Two on-disk formats: v1 (single header) and v2 (dual-meta, crash-safe).** A
+header type opts a volume into **v2** simply by beginning with a `StorageMetaHead
+meta` (magic `STORAGE_V2_MAGIC`, version, a monotonic `txnid`, the high-water
+`offset`, and a whole-block `checksum`); the `storage_has_meta` trait picks the v2
+path with `if constexpr`, so a **v1** header (the reference structs, `toy_wal`)
+keeps the original single-in-place-header path unchanged. v2 is what new Xapiand
+data volumes use; the engine still reads existing v1 volumes read-only through an
+optional legacy-header template param.
 
-**The commit protocol, and its ordering gap.** `write()` `pwrite`s data blocks
-past the current high-water mark and advances `head.offset` in memory. `commit()`
-then `pwrite`s the header (block 0, the new high-water mark) and issues a single
-`fsync`/`full_fsync` (or hands the fd to the async-fsync hook). That single fsync
-covers both the data and the header, but nothing orders the data *before* the
-header the disk persists: on power loss mid-fsync the high-water mark can land on
-disk pointing past data that did not. The per-record footer checksum is the only
-thing that catches this, which is another reason the reference defaults (no
-checksum) are unsafe. Two things would close it, both still open:
+**The v2 commit protocol.** A v2 volume keeps **two** meta blocks (block 0 and
+block 1); record data starts at block 2. `commit()`:
 
-- A write barrier: `fsync` the data, *then* `pwrite` the header, *then* `fsync`
-  the header, so the commit point is never durable before the data it references.
-  (Interacts with the async-fsync hook, which deliberately defers the syscall.)
-- An LMDB-style dual meta block: keep two header blocks, alternate on commit, each
-  with a monotonic id + its own checksum, and on open pick the newest that
-  validates. This makes a torn header write harmless regardless of fsync timing,
-  and it also closes the last unprotected field, since today the header itself
-  (most importantly `head.offset`) carries no checksum. It is a header-format
-  change, so it needs a format-version bump.
+1. `fsync`s the data blocks (barrier 1), so they are durable *before* the commit
+   point that will reference them;
+2. writes the *other* meta block with `txnid + 1`, the new high-water, and a fresh
+   whole-block checksum;
+3. `fsync`s that meta block (barrier 2).
 
-**Efficiency note.** `write()` re-`pwrite`s the current partial tail block on every
-call, so a 4 KiB block holding many small records is written once per record
-(page-cache writes, not fsync, but still one syscall each). Since the tail block
-is not durable until `commit()` anyway, only completed blocks need to be written
-eagerly; flushing the final partial block in `commit()` would cut those syscalls
-without changing durability. Open.
+`open()` reads both meta blocks and adopts the valid one with the highest `txnid`.
+So a torn, lost, or bit-rotted write to the block being committed leaves the
+previous committed meta (in the block it did not touch) intact, and a meta that
+validates always points at durable data. `load_meta` also rejects a meta whose
+high-water runs past EOF (a truncated tail) and a `version` it does not
+understand. This is crash-consistent regardless of fsync timing; the async-fsync
+hook keeps the same issue order (a single deferred fsync flushes data and meta
+together, so a durable meta never outruns its data).
 
+The whole matrix is proven in `test/test_crash.cc`: a `CrashIO` in-memory policy
+logs every `pwrite`/`fsync`, so tests reconstruct the on-disk state after every
+crash point (each write-log prefix, plus the next op torn to one 512 B sector) and
+assert `open()` recovers to a consistent committed state -- never garbage, never a
+crash -- alongside targeted torn-meta / both-corrupt / torn-data / truncated-tail
+cases.
+
+**Integrity of the records themselves is still opt-in.** The v2 meta is always
+magic'd and checksummed by the engine, but per-record integrity comes from the
+consumer's footer. The reference `StorageBinHeader`/`StorageBinFooter` carry no
+per-record magic or checksum (the fields are present but commented out), so a
+consumer using them as-is has no *record*-level corruption detection. Xapiand's
+`WalBinHeader`/`WalBinFooter` (and the docstore's) do carry
+`STORAGE_BIN_HEADER_MAGIC` + `STORAGE_BIN_FOOTER_MAGIC` + XXH32, so real records
+are protected; the `toy_data_store` example shows the same on v2.
+
+**Still open (follow-ups).**
+- The Xapiand **WAL** is still on v1. It is a rescue log (temporary), and it
+  already has record magic + checksum, prefix recovery, and corrupt-volume
+  quarantine; moving it to v2 is delicate high-water/slot surgery best done on its
+  own with a WAL crash test.
+- **Tail-block write amplification:** `write()` re-`pwrite`s the current partial
+  tail block on every call, so a 4 KiB block holding many small records is written
+  once per record (page-cache writes, not fsync, but one syscall each). Since the
+  tail block is not durable until `commit()`, only completed blocks need eager
+  writes; flushing the final partial block in `commit()` would cut those syscalls
+  without changing durability.
+- **Integrity by default:** making the reference structs carry magic + checksum
+  (so a new consumer is safe without opting in) is a reference-format change.
 
 ## Extraction notes (what changed from the in-tree engine)
 

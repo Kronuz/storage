@@ -55,6 +55,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(storage_test PRIVATE storage)
 	add_test(NAME storage COMMAND storage_test)
 
+	# Crash-consistency + corruption matrix for the v2 dual-meta format, driven
+	# through an in-memory write-logging IO policy (simulated power loss).
+	add_executable(storage_test_crash test/test_crash.cc)
+	target_link_libraries(storage_test_crash PRIVATE storage)
+	add_test(NAME storage_crash COMMAND storage_test_crash)
+
 	# A runnable benchmark (not a test): ./build/storage_bench
 	add_executable(storage_bench examples/bench.cc)
 	target_link_libraries(storage_bench PRIVATE storage)
@@ -66,4 +72,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_executable(storage_toy_wal examples/toy_wal.cc)
 	target_link_libraries(storage_toy_wal PRIVATE storage)
 	add_test(NAME storage_toy_wal COMMAND storage_toy_wal)
+
+	# The same, but for the DOCUMENT-STORE pattern (put/get by offset, tombstones,
+	# multi-volume) on the v2 crash-safe (dual-meta) format. Showcases how to build
+	# a Xapiand-style DataStorage and self-checks as a ctest.
+	add_executable(storage_toy_data_store examples/toy_data_store.cc)
+	target_link_libraries(storage_toy_data_store PRIVATE storage)
+	add_test(NAME storage_toy_data_store COMMAND storage_toy_data_store)
 endif()

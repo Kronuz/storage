@@ -112,11 +112,12 @@
 
 #define STORAGE_START_BLOCK_OFFSET (STORAGE_BLOCK_SIZE / STORAGE_ALIGNMENT)
 
-// v2 dual-meta layout: blocks 0 and 1 are the two alternating meta snapshots, so
-// record data starts at block 2 (v1 keeps a single header block and starts at
-// block 1). Offsets are counted in STORAGE_ALIGNMENT units, matching head.offset.
-#define STORAGE_META_BLOCKS 2
-#define STORAGE_START_BLOCK_OFFSET_V2 ((STORAGE_META_BLOCKS * STORAGE_BLOCK_SIZE) / STORAGE_ALIGNMENT)
+// Both v1 and v2 keep a single header at block 0 and start record data at block 1.
+// v2 differs only in that its header carries a StorageMetaHead (magic + version +
+// checksum): the header is crash-safe by single-sector atomicity as long as the
+// bytes that change between commits fit in block 0's first 512-byte sector (they
+// do for a small header like the docstore's), so a torn 4 KB write to block 0
+// still leaves a valid old-or-new header. Offsets count STORAGE_ALIGNMENT units.
 
 #define STORAGE_MIN_COMPRESS_SIZE 100
 
@@ -249,20 +250,27 @@ public:
 using StorageFsyncFn = std::function<void(int fd, bool full_fsync)>;
 
 
-// v2 crash-safe meta block. A v2 volume keeps TWO of these (block 0 and block 1)
-// and alternates which one a commit writes; open() picks the one with the highest
-// `txnid` whose `checksum` validates. A header type opts a volume into the v2
-// format simply by embedding a StorageMetaHead named `meta` as its first member
-// (see the storage_has_meta trait below); everything else about that header type
-// (uuid, revision, slots, ...) follows the meta and is covered by the same
-// whole-block checksum. Legacy v1 headers have no `meta` and keep the original
-// single-in-place-header path unchanged.
+// v2 crash-safe header prefix. A header type opts a volume into the v2 format
+// simply by embedding a StorageMetaHead named `meta` as its FIRST member (see the
+// storage_has_meta trait below); the rest of the header (uuid, revision, slots,
+// ...) follows and is covered by the same checksum. Legacy v1 headers have no
+// `meta` and keep the original path.
+//
+// v2 keeps a SINGLE header at block 0, rewritten in place on commit, data at block
+// 1 -- same layout as v1. Its crash safety comes from single-sector (512 B)
+// write atomicity: as long as the header bytes that change between commits fit in
+// block 0's first sector (28 B of meta + a small uuid, for the docstore), a torn
+// 4 KB block-0 write still yields a valid old-or-new header (the trailing bytes are
+// invariant padding). The magic + checksum additionally catch bit rot and, for a
+// consumer whose header spans sectors and CAN tear (the WAL's slot array), turn a
+// torn header into a clean StorageCorruptVolume that the consumer quarantines.
+// `txnid` is a monotonic commit counter (informational / debugging).
 #pragma pack(push, 1)
 struct StorageMetaHead {
-	uint32_t magic;      // STORAGE_V2_MAGIC (identifies a v2 meta block)
+	uint32_t magic;      // STORAGE_V2_MAGIC (identifies a v2 header)
 	uint16_t version;    // meta format version (currently 2)
 	uint16_t reserved;   // reserved for flags; zero for now
-	uint64_t txnid;      // monotonic commit counter; open picks the highest valid one
+	uint64_t txnid;      // monotonic commit counter
 	uint64_t offset;     // committed high-water mark, in STORAGE_ALIGNMENT units
 	uint32_t checksum;   // XXH32 over the whole block with these 4 bytes treated as zero
 
@@ -393,45 +401,38 @@ class Storage {
 
 	// ---- v1/v2 seam ------------------------------------------------------------
 	// hw_offset is the authoritative committed high-water mark (in STORAGE_ALIGNMENT
-	// units) for BOTH formats -- loaded from header.head.offset (v1) or the winning
-	// meta's offset (v2) on open, bumped by write(), and written back on commit().
-	// vol_format / vol_start describe the CURRENTLY OPEN volume at runtime (not the
-	// consumer's compile-time capability): a v2-capable consumer can still open an
-	// existing v1 volume read-only, where data starts at block 1, not block 2.
+	// units) for BOTH formats -- loaded from header.head.offset (v1) or the meta's
+	// offset (v2) on open, bumped by write(), and written back on commit(). Both
+	// formats keep a single header at block 0 and start data at STORAGE_START_BLOCK_
+	// OFFSET; vol_format records which format the open volume is (a v2-capable
+	// consumer may still open an existing v1 volume read-only). meta_txnid is a
+	// monotonic commit counter for v2 (informational).
 	uint64_t hw_offset;
 	int vol_format;        // 1 or 2: the format of the open volume
-	uint32_t vol_start;    // where record data begins, in STORAGE_ALIGNMENT units
-
-	// v2 dual-meta bookkeeping. meta_slot is which of the two meta blocks (0/1)
-	// holds the current committed snapshot; a commit writes the OTHER one and bumps
-	// meta_txnid, so a torn write to the block being committed leaves the previous
-	// committed meta intact and open() falls back to it.
 	uint64_t meta_txnid;
-	int meta_slot;
 
-	// True iff this consumer's header opts into the v2 dual-meta format.
+	// True iff this consumer's header opts into the v2 (magic + checksum) format.
 	static constexpr bool is_v2 = storage_has_meta_v<StorageHeader>;
 
-	// XXH32 over a whole meta block with the 4-byte checksum field treated as zero
-	// (so the checksum can live inside the block it protects). v2-only.
+	// XXH32 over the whole header block with the 4-byte checksum field treated as
+	// zero (so the checksum can live inside the block it protects). v2-only.
 	static uint32_t meta_checksum(const StorageHeader& h) noexcept {
 		StorageHeader tmp = h;
 		tmp.meta.checksum = 0;
 		return xxh32_oneshot(&tmp, sizeof(StorageHeader), STORAGE_CHECKSUM_SEED);
 	}
 
-	// Build the in-memory meta (consumer fields already populated), stamp it with
-	// the given txnid + current high-water, checksum it, and write it to meta block
-	// `slot` (0 or 1). v2-only.
-	void write_meta(int slot, uint64_t txnid) {
+	// Stamp the in-memory header's meta (consumer fields already populated) with the
+	// next txnid + current high-water, checksum it, and rewrite block 0. v2-only.
+	void write_meta() {
 		header.meta.magic = STORAGE_V2_MAGIC;
 		header.meta.version = StorageMetaHead::CURRENT_VERSION;
 		header.meta.reserved = 0;
-		header.meta.txnid = txnid;
+		header.meta.txnid = ++meta_txnid;
 		header.meta.offset = hw_offset;
 		header.meta.checksum = 0;
 		header.meta.checksum = meta_checksum(header);
-		if unlikely(IO::pwrite(fd, &header, sizeof(header), static_cast<off_t>(slot) * STORAGE_BLOCK_SIZE) != sizeof(header)) {
+		if unlikely(IO::pwrite(fd, &header, sizeof(header), 0) != sizeof(header)) {
 			close();
 			L_ERR("IO error in {}: pwrite meta: {} ({}): {}", repr(path.empty() ? base_path : path), error::name(errno), errno, error::description(errno));
 			THROW(StorageIOError, error::description(errno));
@@ -515,6 +516,11 @@ protected:
 	StorageHeader header;
 	std::string base_path;
 
+	// The live committed/append high-water mark, in STORAGE_ALIGNMENT units, for
+	// subclasses that maintain their own index into the volume (the WAL records it
+	// into its per-revision slot array). Valid for both v1 and v2.
+	uint64_t volume_offset() const noexcept { return hw_offset; }
+
 
 public:
 	Storage(std::string_view base_path_, void* param_, StorageFsyncFn async_fsync = nullptr)
@@ -532,9 +538,7 @@ public:
 		  changed(false),
 		  hw_offset(0),
 		  vol_format(is_v2 ? 2 : 1),
-		  vol_start(is_v2 ? STORAGE_START_BLOCK_OFFSET_V2 : STORAGE_START_BLOCK_OFFSET),
 		  meta_txnid(0),
-		  meta_slot(0),
 		  base_path(storage::normalize_path(base_path_, true)) {
 		memset(&header, 0, sizeof(header));
 		if ((reinterpret_cast<char*>(&bin_header.size) - reinterpret_cast<char*>(&bin_header) + sizeof(bin_header.size)) > STORAGE_ALIGNMENT) {
@@ -570,20 +574,16 @@ public:
 		header.init(param, args);
 
 		if constexpr (is_v2) {
-			// A fresh v2 volume: data begins after the two meta blocks. Write both
-			// meta blocks so open() always finds a valid pair; block 0 wins with
-			// the higher txnid. The consumer's init() set its own fields (uuid,
-			// etc.); write_meta() stamps the engine-owned meta over them.
+			// A fresh v2 volume: a single header at block 0, data at block 1. The
+			// consumer's init() set its own fields (uuid, etc.); write_meta() stamps
+			// the engine-owned meta (magic/version/txnid/high-water/checksum) over
+			// them and writes block 0.
 			vol_format = 2;
-			vol_start = STORAGE_START_BLOCK_OFFSET_V2;
-			hw_offset = vol_start;
-			write_meta(1, 0);   // older snapshot
-			write_meta(0, 1);   // current snapshot
-			meta_slot = 0;
-			meta_txnid = 1;
+			hw_offset = STORAGE_START_BLOCK_OFFSET;
+			meta_txnid = 0;
+			write_meta();
 		} else {
 			vol_format = 1;
-			vol_start = STORAGE_START_BLOCK_OFFSET;
 			if unlikely(IO::write(fd, &header, sizeof(header)) != sizeof(header)) {
 				close();
 				L_ERR("IO error in {}: write: {} ({}): {}", repr(path.empty() ? base_path : path), error::name(errno), errno, error::description(errno));
@@ -592,7 +592,7 @@ public:
 			hw_offset = header.head.offset;
 		}
 
-		seek(vol_start);
+		seek(STORAGE_START_BLOCK_OFFSET);
 	}
 
 	bool open(std::string_view relative_path, int flags_=STORAGE_CREATE_OR_OPEN, void* args=nullptr) {
@@ -637,12 +637,12 @@ public:
 		return reopen();
 	}
 
-	// Read meta block `slot` and return true iff it is a valid v2 meta: full read,
-	// correct magic, a version we understand, a matching whole-block checksum, and
-	// a high-water mark that fits within the physical file (a truncated tail makes
-	// the meta invalid so open() falls back to the other one). v2-only.
-	bool load_meta(int slot, StorageHeader& out) {
-		auto n = IO::pread(fd, &out, sizeof(out), static_cast<off_t>(slot) * STORAGE_BLOCK_SIZE);
+	// Read the header at block 0 into `out` and return true iff it is a valid v2
+	// header: full read, correct magic, a version we understand, a matching
+	// whole-block checksum, and a high-water that fits within the physical file (a
+	// truncated tail makes it invalid). v2-only.
+	bool load_meta(StorageHeader& out) {
+		auto n = IO::pread(fd, &out, sizeof(out), 0);
 		if (n != static_cast<ssize_t>(sizeof(out))) {
 			return false;
 		}
@@ -654,11 +654,11 @@ public:
 		}
 		uint32_t stored = out.meta.checksum;
 		if (meta_checksum(out) != stored) {
-			return false;  // torn or bit-rotted meta
+			return false;  // bit-rotted (or, for a header that spans sectors, torn)
 		}
 		off_t fsize = IO::lseek(fd, 0, SEEK_END);
 		if (fsize != -1 && static_cast<uint64_t>(out.meta.offset) * STORAGE_ALIGNMENT > static_cast<uint64_t>(fsize)) {
-			return false;  // high-water beyond EOF (truncated tail): distrust this meta
+			return false;  // high-water beyond EOF (truncated tail): distrust it
 		}
 		return true;
 	}
@@ -673,21 +673,15 @@ public:
 		}
 
 		if constexpr (is_v2) {
-			// Read BOTH meta blocks; the volume is v2 iff at least one is a valid
-			// meta. Adopt the valid one with the highest txnid (the last successful
-			// commit); a torn/rotted/truncated meta simply loses the tie.
-			StorageHeader m0;
-			StorageHeader m1;
-			bool ok0 = load_meta(0, m0);
-			bool ok1 = load_meta(1, m1);
-			if (ok0 || ok1) {
-				bool pick0 = ok0 && (!ok1 || m0.meta.txnid >= m1.meta.txnid);
-				header = pick0 ? m0 : m1;
-				meta_slot = pick0 ? 0 : 1;
+			// Read the single header at block 0. If it validates, this is a v2
+			// volume; a bad checksum means genuine corruption (or, for a header
+			// whose fields span sectors like the WAL's, a torn write) -> corrupt.
+			StorageHeader m;
+			if (load_meta(m)) {
+				header = m;
 				meta_txnid = header.meta.txnid;
 				hw_offset = header.meta.offset;
 				vol_format = 2;
-				vol_start = STORAGE_START_BLOCK_OFFSET_V2;
 				header.validate(param, args);
 			} else if constexpr (!std::is_void_v<StorageLegacyHeader>) {
 				// Not a v2 volume: fall back to reading the legacy v1 header
@@ -700,9 +694,8 @@ public:
 				legacy.validate(param, args);
 				hw_offset = legacy.head.offset;
 				vol_format = 1;
-				vol_start = STORAGE_START_BLOCK_OFFSET;
 			} else {
-				THROW(StorageCorruptVolume, "No valid v2 meta block");
+				THROW(StorageCorruptVolume, "No valid v2 header");
 			}
 		} else {
 			auto read_size = IO::pread(fd, &header, sizeof(header), 0);
@@ -716,7 +709,6 @@ public:
 			header.validate(param, args);
 			hw_offset = header.head.offset;
 			vol_format = 1;
-			vol_start = STORAGE_START_BLOCK_OFFSET;
 		}
 
 		if (flags & STORAGE_WRITABLE) {
@@ -736,7 +728,7 @@ public:
 			}
 		}
 
-		seek(vol_start);
+		seek(STORAGE_START_BLOCK_OFFSET);
 
 		return false;
 	}
@@ -763,9 +755,7 @@ public:
 		flags = 0;
 		hw_offset = 0;
 		vol_format = is_v2 ? 2 : 1;
-		vol_start = is_v2 ? STORAGE_START_BLOCK_OFFSET_V2 : STORAGE_START_BLOCK_OFFSET;
 		meta_txnid = 0;
-		meta_slot = 0;
 		path.clear();
 	}
 
@@ -1106,21 +1096,19 @@ public:
 		changed = false;
 
 		if constexpr (is_v2) {
-			// Crash-safe commit, in two ordered barriers:
-			//   1. fsync the data blocks so they are durable BEFORE the commit
-			//      point that will reference them.
-			//   2. write the OTHER meta block (higher txnid) and fsync it. A torn
-			//      or lost write here leaves the previous committed meta (in the
-			//      block we did NOT touch) intact, so open() falls back to it and
-			//      the volume never loses its last consistent state.
-			// A durable meta therefore always points at durable data.
+			// Crash-safe commit via an ordered write barrier:
+			//   1. fsync the data blocks so they are durable BEFORE the header that
+			//      references them.
+			//   2. rewrite the single header at block 0 (new high-water + checksum)
+			//      and fsync it.
+			// So a durable header always points at durable data. The header itself
+			// is crash-safe by single-sector atomicity when the bytes that change
+			// between commits fit in block 0's first sector (the docstore); a
+			// consumer whose header spans sectors and can tear (the WAL) gets a
+			// checksum failure on the next open and quarantines.
 			do_sync();
-			int next_slot = 1 - meta_slot;
-			uint64_t next_txnid = meta_txnid + 1;
-			write_meta(next_slot, next_txnid);
+			write_meta();   // bumps meta_txnid, stamps high-water + checksum
 			do_sync();
-			meta_slot = next_slot;
-			meta_txnid = next_txnid;
 		} else {
 			header.head.offset = static_cast<uint32_t>(hw_offset);
 			if unlikely(IO::pwrite(fd, &header, sizeof(header), 0) != sizeof(header)) {

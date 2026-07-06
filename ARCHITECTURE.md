@@ -8,25 +8,27 @@ that follow, each aligned to `STORAGE_ALIGNMENT` (8 bytes).
 ## On-disk layout
 
 ```
-volume file (v1)                     volume file (v2, dual-meta)
-+------------------+  block 0        +------------------+  block 0  meta A
+volume file (v1)                     volume file (v2)
++------------------+  block 0        +------------------+  block 0
 |     Header       |                 |  StorageMetaHead |   magic|version|txnid|
-+------------------+  block 1 .. N   |  + consumer head |   offset|checksum ...
-|  BinHeader       |   per record    +------------------+  block 1  meta B
-|  payload         |                 |  StorageMetaHead |   (alternated per commit)
-|  Footer          |                 +------------------+  block 2 .. N
-|  (alignment pad) |                 |  BinHeader/payload|   records (same framing)
-|  BinHeader ...   |                 |  Footer ...       |
-+------------------+                 +------------------+
+|                  |                 |  + consumer head |   offset|checksum ...
++------------------+  block 1 .. N   +------------------+  block 1 .. N
+|  BinHeader       |   per record    |  BinHeader        |   records (same framing)
+|  payload         |                 |  payload          |
+|  Footer          |                 |  Footer ...       |
+|  (alignment pad) |                 +------------------+
+|  BinHeader ...   |
++------------------+
 ```
 
-A record's **offset** (what `write()` returns and `read()`/`seek()` take) is its
-position in 8-byte alignment units, so a 32-bit offset addresses up to 32 GiB per
-volume. The **high-water mark** is the running append cursor: in v1 it lives in
-the header's `head.offset`, written back to block 0 by `commit()`; in v2 it lives
-in the meta's `offset`, written to the alternate meta block under a fsync barrier
-(see "Durability and failure modes"). The engine tracks it in one place
-(`hw_offset`) for both formats.
+Both formats keep a **single header at block 0** and start record data at block 1;
+v2 differs only in that its header carries a `StorageMetaHead` (a magic, version,
+and checksum). A record's **offset** (what `write()` returns and `read()`/`seek()`
+take) is its position in 8-byte alignment units, so a 32-bit offset addresses up to
+32 GiB per volume. The **high-water mark** is the running append cursor: v1 keeps it
+in the header's `head.offset`, v2 in the meta's `offset`; either way `commit()`
+rewrites block 0 (under a fsync barrier for v2) and the engine tracks it in one
+place (`hw_offset`).
 
 `Header`, `BinHeader`, and `Footer` are **template parameters**, not fixed
 structs. The engine only calls their `init()` / `validate()` hooks, so a consumer
@@ -107,41 +109,47 @@ corrupt record:
   record trips `StorageCorruptVolume` and is isolated to that record; its
   neighbours, independently addressed, still read.
 
-**Two on-disk formats: v1 (single header) and v2 (dual-meta, crash-safe).** A
-header type opts a volume into **v2** simply by beginning with a `StorageMetaHead
-meta` (magic `STORAGE_V2_MAGIC`, version, a monotonic `txnid`, the high-water
-`offset`, and a whole-block `checksum`); the `storage_has_meta` trait picks the v2
-path with `if constexpr`, so a **v1** header (the reference structs, `toy_wal`)
-keeps the original single-in-place-header path unchanged. v2 is what new Xapiand
-data volumes use; the engine still reads existing v1 volumes read-only through an
-optional legacy-header template param.
+**Two on-disk formats: v1 and v2 (crash-safe).** A header type opts a volume into
+**v2** simply by beginning with a `StorageMetaHead meta` (magic `STORAGE_V2_MAGIC`,
+version, a monotonic `txnid`, the high-water `offset`, and a whole-block
+`checksum`); the `storage_has_meta` trait picks the v2 path with `if constexpr`, so
+a **v1** header (the reference structs, `toy_wal`) keeps the original path
+unchanged. Both formats keep a single header at block 0 and data at block 1; v2 is
+what new Xapiand data volumes use, and the engine still reads existing v1 volumes
+read-only through an optional legacy-header template param.
 
-**The v2 commit protocol.** A v2 volume keeps **two** meta blocks (block 0 and
-block 1); record data starts at block 2. `commit()`:
+**The v2 commit protocol.** `commit()`:
 
-1. `fsync`s the data blocks (barrier 1), so they are durable *before* the commit
-   point that will reference them;
-2. writes the *other* meta block with `txnid + 1`, the new high-water, and a fresh
-   whole-block checksum;
-3. `fsync`s that meta block (barrier 2).
+1. `fsync`s the data blocks (barrier 1), so they are durable *before* the header
+   that will reference them;
+2. rewrites the single header at block 0 with `txnid + 1`, the new high-water, and
+   a fresh checksum;
+3. `fsync`s the header (barrier 2).
 
-`open()` reads both meta blocks and adopts the valid one with the highest `txnid`.
-So a torn, lost, or bit-rotted write to the block being committed leaves the
-previous committed meta (in the block it did not touch) intact, and a meta that
-validates always points at durable data. `load_meta` also rejects a meta whose
-high-water runs past EOF (a truncated tail) and a `version` it does not
-understand. This is crash-consistent regardless of fsync timing; the async-fsync
-hook keeps the same issue order (a single deferred fsync flushes data and meta
-together, so a durable meta never outruns its data).
+A durable header therefore always points at durable data. `open()` reads block 0,
+validates magic + version + checksum, and rejects a header whose high-water runs
+past EOF (a truncated tail).
+
+**Why a single header is crash-safe: sector atomicity.** Storage devices write a
+single sector (512 B) atomically. The bytes that change between commits -- the
+28-byte `StorageMetaHead` -- fit in block 0's first sector; everything after is
+invariant (padding for the docstore). So a torn 4 KB block-0 write on power loss
+yields `[old-or-new first sector (atomic)] + [unchanged rest]` = a *valid* header,
+either the old committed state or the new one. With the fsync barrier the newer
+commit's data is already durable, so recovering to the old header just leaves that
+data as ignored orphans. The magic + checksum still catch genuine bit rot, and a
+consumer whose header *does* span sectors and can tear (the WAL's slot array) gets
+a clean `StorageCorruptVolume` on open and quarantines. This is why the record
+magic makes a second (LMDB-style) meta block unnecessary here.
 
 The whole matrix is proven in `test/test_crash.cc`: a `CrashIO` in-memory policy
 logs every `pwrite`/`fsync`, so tests reconstruct the on-disk state after every
 crash point (each write-log prefix, plus the next op torn to one 512 B sector) and
 assert `open()` recovers to a consistent committed state -- never garbage, never a
-crash -- alongside targeted torn-meta / both-corrupt / torn-data / truncated-tail
-cases.
+crash -- alongside targeted sector-atomicity, header bit-rot, torn-data, and
+truncated-tail cases.
 
-**Integrity of the records themselves is still opt-in.** The v2 meta is always
+**Integrity of the records themselves is still opt-in.** The v2 header is always
 magic'd and checksummed by the engine, but per-record integrity comes from the
 consumer's footer. The reference `StorageBinHeader`/`StorageBinFooter` carry no
 per-record magic or checksum (the fields are present but commented out), so a
@@ -151,10 +159,11 @@ consumer using them as-is has no *record*-level corruption detection. Xapiand's
 are protected; the `toy_data_store` example shows the same on v2.
 
 **Still open (follow-ups).**
-- The Xapiand **WAL** is still on v1. It is a rescue log (temporary), and it
-  already has record magic + checksum, prefix recovery, and corrupt-volume
-  quarantine; moving it to v2 is delicate high-water/slot surgery best done on its
-  own with a WAL crash test.
+- The Xapiand **WAL** is now v2 as well: its header carries a `StorageMetaHead`,
+  data starts at block 1, and because its slot array spans the whole block a torn
+  header is caught by the checksum and the WAL quarantines the volume (it is a
+  rescue log; existing v1 WAL volumes quarantine on upgrade the same way, since
+  they have no v2 header). Only the docstore keeps the v1-read path.
 - **Tail-block write amplification:** `write()` re-`pwrite`s the current partial
   tail block on every call, so a 4 KiB block holding many small records is written
   once per record (page-cache writes, not fsync, but one syscall each). Since the

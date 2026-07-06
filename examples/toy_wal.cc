@@ -11,10 +11,11 @@
  * codec, or the header/footer integrity checks, this example fails and catches
  * the regression before it reaches Xapiand.
  *
- * The usage shape mirrors Xapiand faithfully:
- *   - a custom Header / BinHeader / BinFooter carrying magic + a footer checksum
- *     (Xapiand's DataHeader / DataBinHeader / DataBinFooter),
- *   - a Storage<...> subclass (Xapiand's DataStorage),
+ * The usage shape mirrors Xapiand faithfully, on the crash-safe v2 format:
+ *   - a Header that begins with a StorageMetaHead (opting into v2), plus a
+ *     BinHeader / BinFooter carrying magic + a footer checksum (Xapiand's
+ *     WalHeader / WalBinHeader / WalBinFooter),
+ *   - a Storage<...> subclass (Xapiand's DatabaseWAL / DataStorage),
  *   - open(WRITABLE | CREATE | COMPRESS_ZSTD | FULL_SYNC), write() -> offset,
  *     commit(), then reopen(OPEN) + seek(offset) + read().
  */
@@ -38,33 +39,23 @@ static int failures = 0;
 	} while (0)
 
 
-// Magic'd header + a footer that actually keeps a checksum, mirroring how
-// Xapiand's DataStorage detects corrupt volumes (shard.cc's DataBinHeader /
-// DataBinFooter carry STORAGE_BIN_HEADER_MAGIC / STORAGE_BIN_FOOTER_MAGIC and the
-// DELETED flag; its header now uses the crash-safe v2 meta).
-constexpr uint32_t TOY_WAL_MAGIC    = 0x57414C21;  // "WAL!"
+// The v2 (crash-safe) header: it begins with the engine-owned StorageMetaHead
+// (magic + version + high-water + checksum), so the engine handles header integrity
+// and the crash-safe commit; the consumer only adds its own fields after it (none
+// needed here) and pads to a block. The footer keeps a per-record checksum, exactly
+// like Xapiand's WalBinFooter / DataBinFooter. v1 (a plain offset header, no meta)
+// is legacy and only kept so old volumes can still be read.
 constexpr uint8_t  TOY_BIN_MAGIC    = 0xB1;
 constexpr uint8_t  TOY_FOOTER_MAGIC = 0xF0;
 
 struct WalHeader {
-	struct WalHeaderHead {
-		uint32_t magic;
-		uint32_t offset;  // required by the engine
-	} head;
+	StorageMetaHead meta;
+	char padding[STORAGE_BLOCK_SIZE - sizeof(StorageMetaHead)];
 
-	char padding[(STORAGE_BLOCK_SIZE - sizeof(WalHeader::WalHeaderHead)) / sizeof(char)];
-
-	void init(void* /*param*/, void* /*args*/) {
-		head.magic = TOY_WAL_MAGIC;
-		head.offset = STORAGE_START_BLOCK_OFFSET;
-	}
-
-	void validate(void* /*param*/, void* /*args*/) {
-		if (head.magic != TOY_WAL_MAGIC) {
-			THROW(StorageCorruptVolume, "Bad WAL header magic");
-		}
-	}
+	void init(void* /*param*/, void* /*args*/) { }      // engine stamps meta
+	void validate(void* /*param*/, void* /*args*/) { }  // engine validates meta
 };
+static_assert(sizeof(WalHeader) == STORAGE_BLOCK_SIZE, "header must be one block");
 
 #pragma pack(push, 1)
 struct WalBinHeader {

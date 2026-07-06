@@ -1,5 +1,5 @@
 /*
- * test_crash: crash-consistency and corruption tests for the v2 dual-meta format.
+ * test_crash: crash-consistency and corruption tests for the v2 (single checksummed header) format.
  *
  * We cannot cut power, but every on-disk state a power cut leaves behind is
  * reproducible. Two hardware facts bound the model:
@@ -271,31 +271,10 @@ int main() {
 	CHECK(max_recovered == static_cast<int>(recs.size()));
 	CHECK(committed_after_first == 3);
 
-	// ---- TARGETED: torn/corrupt ONE meta block -> fall back to the other ----
-	{
-		crashio::state().reset();
-		CrashStore w(BASE, nullptr);
-		w.open(REL, STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_FULL_SYNC);
-		uint32_t o0 = w.write("meta-fallback record");
-		w.commit();               // writes meta slot 1 (txnid 2)
-		uint32_t o1 = w.write("second record");
-		w.commit();               // writes meta slot 0 (txnid 3)
-		w.close();
-		g_key = crashio::state().files.begin()->first;
-
-		// Corrupt meta block 0 (the newest). Reader must fall back to block 1 and
-		// still read the record committed as of that older-but-valid snapshot.
-		auto img = crashio::state().files[g_key];
-		img[16] ^= 0xFF;          // scribble inside meta block 0's fixed fields
-		crashio::state().files[g_key] = img;
-		CrashStore r(BASE, nullptr);
-		r.open(REL, STORAGE_OPEN);   // must NOT throw: block 1 is valid
-		r.seek(o0);
-		CHECK(r.read() == "meta-fallback record");
-		(void)o1;
-	}
-
-	// ---- TARGETED: BOTH meta blocks corrupt -> refuse, never guess ----
+	// ---- TARGETED: header bit rot -> open throws (single header, no fallback) ----
+	// A genuinely corrupted (bit-rotted) header fails its checksum. With a single
+	// header there is nothing to fall back to, so open() refuses rather than trust a
+	// bad high-water. (A power-loss TEAR is different -- see sector atomicity below.)
 	{
 		crashio::state().reset();
 		CrashStore w(BASE, nullptr);
@@ -306,8 +285,7 @@ int main() {
 		g_key = crashio::state().files.begin()->first;
 
 		auto img = crashio::state().files[g_key];
-		img[16] ^= 0xFF;                          // corrupt meta block 0
-		img[STORAGE_BLOCK_SIZE + 16] ^= 0xFF;     // corrupt meta block 1
+		img[8] ^= 0xFF;   // flip a byte in the meta (txnid/offset region)
 		crashio::state().files[g_key] = img;
 		CrashStore r(BASE, nullptr);
 		bool threw = false;
@@ -315,6 +293,47 @@ int main() {
 		catch (const StorageCorruptVolume&) { threw = true; }
 		catch (...) {}
 		CHECK(threw);
+	}
+
+	// ---- TARGETED: sector atomicity -- a torn header write is always safe ----
+	// The header's changing bytes (the meta) fit in block 0's first 512 B sector,
+	// and sectors write atomically, so a torn block-0 write yields either the OLD or
+	// the NEW header -- both valid. With the fsync barrier the data is durable before
+	// the header, so recovering to the OLD header (its high-water) just leaves the
+	// newer commit's records as ignored orphans.
+	{
+		crashio::state().reset();
+		CrashStore w(BASE, nullptr);
+		w.open(REL, STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_FULL_SYNC);
+		uint32_t o0 = w.write("first commit record");
+		w.commit();
+		g_key = crashio::state().files.begin()->first;
+		auto after_first = crashio::state().files[g_key];
+		uint32_t o1 = w.write("second commit record");
+		w.commit();
+		auto after_second = crashio::state().files[g_key];
+		w.close();
+
+		// (a) the 2nd commit fully landed (new header) -> both records visible.
+		{
+			crashio::state().files[g_key] = after_second;
+			CrashStore r(BASE, nullptr); r.open(REL, STORAGE_OPEN);
+			r.seek(o0); CHECK(r.read() == "first commit record");
+			r.seek(o1); CHECK(r.read() == "second commit record");
+		}
+		// (b) the 2nd commit's DATA landed but its header write landed NOTHING (block
+		//     0 still the 1st commit's header): recover to the 1st commit, the 2nd
+		//     record is beyond the old high-water and simply not visible.
+		{
+			auto torn = after_second;
+			for (size_t i = 0; i < STORAGE_BLOCK_SIZE; ++i) { torn[i] = after_first[i]; }
+			crashio::state().files[g_key] = torn;
+			CrashStore r(BASE, nullptr); r.open(REL, STORAGE_OPEN);
+			r.seek(o0); CHECK(r.read() == "first commit record");
+			bool eof = false;
+			try { r.seek(o1); r.read(); } catch (const StorageException&) { eof = true; }
+			CHECK(eof);
+		}
 	}
 
 	// ---- TARGETED: a torn data block (payload half-written) is caught, and the
@@ -343,30 +362,31 @@ int main() {
 		CHECK(caught);                                        // torn record detected
 	}
 
-	// ---- TARGETED: truncated tail (file shorter than the meta's high-water) ----
-	// The fs kept the meta but lost the record data (a torn append + a metadata
-	// size not updated). load_meta's fsize guard distrusts a meta whose high-water
-	// runs past EOF and falls back to the empty init meta: open succeeds, no record
-	// reads back as garbage.
+	// ---- TARGETED: truncated tail (file shorter than the header's high-water) ----
+	// A genuine fs truncation lost committed data the header still references. With
+	// the fsync barrier this cannot happen on a normal crash (data is durable before
+	// the header), so it signals real corruption: load_meta's fsize guard rejects
+	// the header and, with no fallback, open() refuses rather than read past the
+	// surviving data.
 	{
 		crashio::state().reset();
 		CrashStore w(BASE, nullptr);
 		w.open(REL, STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_FULL_SYNC);
-		uint32_t oa = w.write("record that will be truncated away");
+		w.write("record that will be truncated away");
 		w.write("another one");
 		w.commit();
 		w.close();
 		g_key = crashio::state().files.begin()->first;
 
 		auto img = crashio::state().files[g_key];
-		img.resize(STORAGE_META_BLOCKS * STORAGE_BLOCK_SIZE);   // drop all record data
+		img.resize(STORAGE_BLOCK_SIZE);   // keep only block 0 (the header); drop data
 		crashio::state().files[g_key] = img;
 		CrashStore r(BASE, nullptr);
-		r.open(REL, STORAGE_OPEN);          // must NOT throw
-		bool gone = false;
-		try { r.seek(oa); r.read(); }
-		catch (const StorageException&) { gone = true; }
-		CHECK(gone);                         // record gone, but nothing garbage returned
+		bool threw = false;
+		try { r.open(REL, STORAGE_OPEN); }
+		catch (const StorageCorruptVolume&) { threw = true; }
+		catch (...) {}
+		CHECK(threw);
 	}
 
 	if (failures == 0) {

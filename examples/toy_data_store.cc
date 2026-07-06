@@ -3,17 +3,19 @@
  * on top of `storage` exactly the way Xapiand's DataStorage (src/database/shard.cc)
  * does -- documents addressed by offset, a magic + checksum on every record, a
  * DELETED tombstone flag, compression, and multiple volumes -- but on the v2
- * CRASH-SAFE format (dual-meta header, see StorageMetaHead in storage.h).
+ * CRASH-SAFE format (a checksummed StorageMetaHead header, see storage.h).
  *
  * Opting a volume into v2 is a one-liner: the header type begins with a
- * `StorageMetaHead meta;`. The engine then keeps TWO alternating meta blocks and
- * commits with a data->meta fsync barrier, so a torn or lost meta write on power
- * loss falls back to the previous committed snapshot instead of losing the volume.
+ * `StorageMetaHead meta;`. commit() then fsyncs the data, rewrites the single
+ * header at block 0 (new high-water + checksum), and fsyncs it -- a data->header
+ * barrier. The header is crash-safe by single-sector atomicity: its changing bytes
+ * (the meta) fit in block 0's first 512 B sector, so a torn block-0 write on power
+ * loss still yields a valid old-or-new header.
  *
  * It doubles as a REGRESSION TEST: every step asserts and main() returns non-zero
  * on any failure, so CMake registers it with ctest. The companion crash-injection
- * matrix in test/test.cc drives this exact header/record shape through simulated
- * power loss.
+ * matrix in test/test_crash.cc drives this exact header/record shape through
+ * simulated power loss.
  */
 
 #include "storage.h"
@@ -39,7 +41,7 @@ constexpr uint8_t TOY_DS_BIN_MAGIC    = 0xD5;
 constexpr uint8_t TOY_DS_FOOTER_MAGIC = 0x5D;
 
 // The v2 header. It MUST begin with `StorageMetaHead meta;` (that is what opts the
-// volume into the dual-meta format and what the engine stamps + checksums). After
+// volume into the v2 format and what the engine stamps + checksums). After
 // it come the consumer's own fields -- here a uuid, exactly like Xapiand's
 // DataHeader carries one to reject a foreign volume -- padded to a full block. The
 // whole block (meta + uuid + pad) is covered by the meta checksum.
@@ -110,7 +112,7 @@ struct DsBinFooter {
 
 // The store, exactly like Xapiand's `DataStorage : public Storage<DataHeader,
 // DataBinHeader, DataBinFooter>`. Because DataStoreHeader begins with a
-// StorageMetaHead, this is automatically a v2 (dual-meta, crash-safe) store.
+// StorageMetaHead, this is automatically a v2 (crash-safe) store.
 class ToyDataStore : public Storage<DataStoreHeader, DsBinHeader, DsBinFooter> {
 public:
 	explicit ToyDataStore(std::string_view base, void* param = nullptr)
@@ -166,7 +168,7 @@ int main() {
 		CHECK_THROWS(ds.open("data.0", STORAGE_OPEN), StorageCorruptVolume);
 	}
 
-	// ---- the dual-meta commit alternates blocks: append + a 2nd commit, reopen
+	// ---- the v2 commit rewrites the header: append + a 2nd commit, reopen
 	//      still reads the newest snapshot AND every earlier document ----
 	uint32_t off5 = 0;
 	{
@@ -195,7 +197,7 @@ int main() {
 	}
 
 	if (failures == 0) {
-		std::puts("toy_data_store: all checks passed (put/get by offset + compress + v2 dual-meta commit + reopen + multi-volume)");
+		std::puts("toy_data_store: all checks passed (put/get by offset + compress + v2 crash-safe commit + reopen + multi-volume)");
 	}
 	return failures == 0 ? 0 : 1;
 }

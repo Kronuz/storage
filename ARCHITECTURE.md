@@ -76,6 +76,73 @@ The checksum is XXH32 over the *uncompressed* bytes (the same for a raw or
 compressed record), via the compressors library's canonical XXH32, which matches
 upstream xxHash digests — so checksums are byte-identical to the in-tree engine.
 
+## Durability and failure modes
+
+An append-only store is easy to write and easy to read; the hard part is what
+happens when a write is interrupted or a volume is damaged. The contract here:
+damage must be **detected** (a `Storage*` exception, never a crash, an unbounded
+allocation, or silently returned garbage), and every record committed **before**
+the damage must remain readable. What backs that contract, and where the current
+gaps are:
+
+**What the reader guarantees.** `read()` throws, never misbehaves, on a torn or
+corrupt record:
+
+- A short read of the header, payload, or footer (a truncated tail from a torn
+  write or power loss) throws `StorageCorruptVolume` (`Incomplete bin ...`).
+- Reads are bounded by the committed high-water mark (`header.head.offset`), so a
+  preallocated or power-loss zero tail past that mark is `StorageEOF`, not a
+  phantom empty record.
+- The size field is validated against that same high-water mark before it is
+  trusted for I/O or allocation, so a garbled size (the bin header is not
+  checksummed, and one flipped byte can turn it into ~4 GB) is a clean
+  `StorageCorruptVolume`, not a multi-gigabyte allocation.
+- `seek()` clears the per-record read state, so a read after an interrupted or
+  partially-consumed prior read starts clean instead of reinterpreting the next
+  record with a stale header.
+- When the consumer supplies a checksummed footer (see below), bit rot inside a
+  record trips `StorageCorruptVolume` and is isolated to that record; its
+  neighbours, independently addressed, still read.
+
+**Integrity is opt-in, and off by default.** The reference `StorageHeader`,
+`StorageBinHeader`, and `StorageBinFooter` carry **no magic and no checksum** (the
+fields are present but commented out). They are the faithful on-disk reference,
+but a consumer that uses them as-is runs with no corruption detection, and a torn
+tail can read back as silent garbage. A consumer that wants the guarantees above
+must supply header/footer types that carry a magic and a footer checksum. Xapiand
+does (`WalBinHeader`/`WalBinFooter` carry `STORAGE_BIN_HEADER_MAGIC` +
+`STORAGE_BIN_FOOTER_MAGIC` + XXH32), so real WAL and docstore records are
+protected; its replay recovers the good prefix and quarantines a corrupt volume
+rather than deleting it.
+
+**The commit protocol, and its ordering gap.** `write()` `pwrite`s data blocks
+past the current high-water mark and advances `head.offset` in memory. `commit()`
+then `pwrite`s the header (block 0, the new high-water mark) and issues a single
+`fsync`/`full_fsync` (or hands the fd to the async-fsync hook). That single fsync
+covers both the data and the header, but nothing orders the data *before* the
+header the disk persists: on power loss mid-fsync the high-water mark can land on
+disk pointing past data that did not. The per-record footer checksum is the only
+thing that catches this, which is another reason the reference defaults (no
+checksum) are unsafe. Two things would close it, both still open:
+
+- A write barrier: `fsync` the data, *then* `pwrite` the header, *then* `fsync`
+  the header, so the commit point is never durable before the data it references.
+  (Interacts with the async-fsync hook, which deliberately defers the syscall.)
+- An LMDB-style dual meta block: keep two header blocks, alternate on commit, each
+  with a monotonic id + its own checksum, and on open pick the newest that
+  validates. This makes a torn header write harmless regardless of fsync timing,
+  and it also closes the last unprotected field, since today the header itself
+  (most importantly `head.offset`) carries no checksum. It is a header-format
+  change, so it needs a format-version bump.
+
+**Efficiency note.** `write()` re-`pwrite`s the current partial tail block on every
+call, so a 4 KiB block holding many small records is written once per record
+(page-cache writes, not fsync, but still one syscall each). Since the tail block
+is not durable until `commit()` anyway, only completed blocks need to be written
+eagerly; flushing the final partial block in `commit()` would cut those syscalls
+without changing durability. Open.
+
+
 ## Extraction notes (what changed from the in-tree engine)
 
 The engine logic (block layout, alignment, buffering, compression framing,

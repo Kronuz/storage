@@ -62,8 +62,8 @@ just read; a mismatch throws `StorageCorruptVolume`.
 
 The bin header's `STORAGE_FLAG_COMPRESSED` bit marks whether a record's payload is
 compressed, and bits 2-4 hold the **codec id** (LZ4 = 0, ZSTD = 1, DEFLATE = 2).
-The open flags pick the write codec (`STORAGE_COMPRESS` for LZ4,
-`STORAGE_COMPRESS_ZSTD`, `STORAGE_COMPRESS_DEFLATE`); `read()` dispatches on the
+The open flags pick the write codec (`STORAGE_COMPRESS_ZSTD` — the default —
+`STORAGE_COMPRESS_LZ4`, or `STORAGE_COMPRESS_DEFLATE`); `read()` dispatches on the
 stored id. Because LZ4 is codec 0, a volume written before codec-in-header (whose
 records have the compressed bit set and the codec bits zero) reads back as LZ4
 with no migration, and a single volume can mix codecs and raw records (records

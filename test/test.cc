@@ -112,7 +112,7 @@ int main() {
 	// ---- compressed round-trip (data > STORAGE_MIN_COMPRESS_SIZE) ----
 	{
 		RefStorage w(base, nullptr);
-		w.open("ref.1", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS);
+		w.open("ref.1", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS_LZ4);
 		std::string data;
 		for (int i = 0; i < 500; ++i) { data += "the quick brown fox jumps over the lazy dog. "; }
 		uint32_t off = w.write(data);
@@ -129,7 +129,7 @@ int main() {
 	// ---- multiple sequential writes, each addressable by its offset ----
 	{
 		RefStorage w(base, nullptr);
-		w.open("ref.2", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS);
+		w.open("ref.2", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS_LZ4);
 		std::string a = "first record";
 		std::string b(2000, 'x');     // compressible, large
 		std::string c = "third record, short";
@@ -217,7 +217,7 @@ int main() {
 		if (f) { std::fwrite(contents.data(), 1, contents.size(), f); std::fclose(f); }
 
 		RefStorage w(base, nullptr);
-		w.open("wf.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS);
+		w.open("wf.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS_LZ4);
 		uint32_t off = w.write_file(src);
 		w.commit();
 		w.close();
@@ -268,7 +268,7 @@ int main() {
 
 		struct CodecCase { const char* vol; int open_flag; uint8_t expect_codec; };
 		const CodecCase codecs[] = {
-			{"cd_lz4.0",     STORAGE_COMPRESS,         STORAGE_CODEC_LZ4},
+			{"cd_lz4.0",     STORAGE_COMPRESS_LZ4,         STORAGE_CODEC_LZ4},
 			{"cd_zstd.0",    STORAGE_COMPRESS_ZSTD,    STORAGE_CODEC_ZSTD},
 			{"cd_deflate.0", STORAGE_COMPRESS_DEFLATE, STORAGE_CODEC_DEFLATE},
 		};
@@ -293,7 +293,7 @@ int main() {
 			r.close();
 		}
 
-		// Back-compat: plain STORAGE_COMPRESS must tag codec 0 (LZ4) so a volume
+		// Back-compat: plain STORAGE_COMPRESS_LZ4 must tag codec 0 (LZ4) so a volume
 		// written before codec-in-header (flags had only bit 0 set) still reads.
 		int lz4_flags = first_bin_flags(base + "cd_lz4.0");
 		CHECK(((lz4_flags & STORAGE_CODEC_MASK) >> STORAGE_CODEC_SHIFT) == 0);
@@ -334,7 +334,7 @@ int main() {
 				std::vector<uint32_t> offs;
 				{
 					RefStorage w(cbase, nullptr);
-					w.open(vol, STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS);
+					w.open(vol, STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS_LZ4);
 					for (int i = 0; i < 100; ++i) { offs.push_back(w.write(payload)); }
 					w.commit();
 					w.close();
@@ -369,7 +369,7 @@ int main() {
 		for (int i = 0; i < 500; ++i) { data += "compressible size-guard payload, repeated. "; }
 
 		CkStorage w(base, nullptr);
-		w.open("sz.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS);
+		w.open("sz.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS_LZ4);
 		uint32_t off = w.write(data);
 		w.commit();
 		w.close();

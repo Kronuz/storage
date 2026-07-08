@@ -145,7 +145,7 @@ int main() {
 	// ---- put phase: store each document, keep its offset (the locator) ----
 	{
 		ToyDataStore ds(base, uuid);
-		ds.open("data.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS | STORAGE_FULL_SYNC);
+		ds.open("data.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS_LZ4 | STORAGE_FULL_SYNC);
 		for (const auto& d : docs) {
 			offs.push_back(ds.write(d));
 		}
@@ -173,7 +173,7 @@ int main() {
 	uint32_t off5 = 0;
 	{
 		ToyDataStore ds(base, uuid);
-		ds.open("data.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS | STORAGE_FULL_SYNC);
+		ds.open("data.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS_LZ4 | STORAGE_FULL_SYNC);
 		off5 = ds.write("{\"id\":5,\"body\":\"second commit\"}");
 		ds.commit();
 	}
@@ -187,7 +187,7 @@ int main() {
 	// ---- a second volume, independent of the first (docstore spans many) ----
 	{
 		ToyDataStore ds(base, uuid);
-		ds.open("data.1", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS | STORAGE_FULL_SYNC);
+		ds.open("data.1", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS_LZ4 | STORAGE_FULL_SYNC);
 		uint32_t o = ds.write("{\"id\":99,\"vol\":1}");
 		ds.commit();
 		ds.close();

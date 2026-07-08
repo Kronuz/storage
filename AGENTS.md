@@ -62,8 +62,8 @@ cmake -B build-tsan -DCMAKE_CXX_FLAGS="-fsanitize=thread  -g" && cmake --build b
 
 Codec-in-header is implemented: the bin-header flags carry the compressed bit
 (0x01) and the codec id in bits 2-4 (LZ4 = 0, ZSTD = 1, DEFLATE = 2). Open flags
-pick the write codec (`STORAGE_COMPRESS` / `STORAGE_COMPRESS_ZSTD` /
-`STORAGE_COMPRESS_DEFLATE`); `read()` dispatches on the stored id. LZ4 = 0 keeps
+pick the write codec (`STORAGE_COMPRESS_ZSTD` — the default — `STORAGE_COMPRESS_LZ4`
+/ `STORAGE_COMPRESS_DEFLATE`); `read()` dispatches on the stored id. LZ4 = 0 keeps
 pre-codec volumes readable. Compression uses the compressors library's one-shot
 helpers (same framing as its streaming classes, so LZ4 is byte-identical to the
 in-tree engine); `write()`/`read()` buffer the whole record rather than streaming

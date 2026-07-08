@@ -94,19 +94,23 @@
 
 // Volume header magic. STORAGE_MAGIC identifies the current (v2) format: a single
 // checksummed header (StorageMetaHead) at block 0, crash-safe by sector atomicity.
-// _LEGACY_STORAGE_MAGIC identifies the legacy v1 format (a bare offset header, no
-// checksum), kept only so old volumes can still be read. Its value is unchanged
-// from the original magic, so existing v1 volumes and record checksums (which seed
-// XXH32 with it) stay byte-compatible.
-#define _LEGACY_STORAGE_MAGIC 0x02DEBC47
 #define STORAGE_MAGIC 0x584B5632  // "2VKX" on little-endian disk; Xapiand/Kronuz v2
 #define STORAGE_BIN_HEADER_MAGIC 0x2A
 #define STORAGE_BIN_FOOTER_MAGIC 0x42
 
-// The seed for record footer checksums: a fixed constant shared by v1 and v2
-// records, which are byte-identical, so a record written under either format
-// validates the same way.
-#define STORAGE_CHECKSUM_SEED _LEGACY_STORAGE_MAGIC
+// The seed for record footer checksums: a fixed constant used by every record.
+// v1 and v2 records are byte-identical, so a record validates the same way under
+// either format. This is a standalone value (historically it happened to match
+// the v1 header magic), independent of the legacy format below.
+#define STORAGE_CHECKSUM_SEED 0x02DEBC47
+
+#if STORAGE_LEGACY_SUPPORT
+// _LEGACY_STORAGE_MAGIC identifies the legacy v1 format: a bare offset header
+// carrying this magic, with no header checksum. Kept only so old volumes can
+// still be read, and confined to STORAGE_LEGACY_SUPPORT so a v2-only build drops
+// every trace of v1 (this magic included).
+#define _LEGACY_STORAGE_MAGIC 0x02DEBC47
+#endif  // STORAGE_LEGACY_SUPPORT
 
 #define STORAGE_BLOCK_SIZE (1024 * 4)
 #define STORAGE_ALIGNMENT 8
@@ -138,22 +142,23 @@ constexpr int STORAGE_CREATE_OR_OPEN   = 0x03;  // Create database if it doesn't
 constexpr int STORAGE_ASYNC_SYNC       = 0x04;  // fsync (or full_fsync) is async
 constexpr int STORAGE_FULL_SYNC        = 0x08;  // Try to ensure changes are really written to disk.
 constexpr int STORAGE_NO_SYNC          = 0x10;  // Don't attempt to ensure changes have hit disk.
-constexpr int STORAGE_COMPRESS         = 0x20;  // Compress data in storage (LZ4 -- the back-compat default).
-constexpr int STORAGE_COMPRESS_ZSTD    = 0x40;  // Compress with Zstandard instead of LZ4.
-constexpr int STORAGE_COMPRESS_DEFLATE = 0x80;  // Compress with Deflate instead of LZ4.
-constexpr int STORAGE_COMPRESS_MASK    = STORAGE_COMPRESS | STORAGE_COMPRESS_ZSTD | STORAGE_COMPRESS_DEFLATE;
+constexpr int STORAGE_COMPRESS_LZ4     = 0x20;  // Compress with LZ4 (legacy: fastest, lowest ratio).
+constexpr int STORAGE_COMPRESS_ZSTD    = 0x40;  // Compress with Zstandard (the default: best size/speed balance).
+constexpr int STORAGE_COMPRESS_DEFLATE = 0x80;  // Compress with Deflate (zlib).
+constexpr int STORAGE_COMPRESS_MASK    = STORAGE_COMPRESS_LZ4 | STORAGE_COMPRESS_ZSTD | STORAGE_COMPRESS_DEFLATE;
 
 constexpr int STORAGE_FLAG_COMPRESSED  = 0x01;
 constexpr int STORAGE_FLAG_DELETED     = 0x02;
 constexpr int STORAGE_FLAG_MASK        = STORAGE_FLAG_COMPRESSED | STORAGE_FLAG_DELETED;
 
 // Per-record codec, stored in the bin-header flags (bits 2-4) when
-// STORAGE_FLAG_COMPRESSED is set. LZ4 is 0 so volumes written before
-// codec-in-header (LZ4 was the only codec then) keep reading as LZ4 with no
-// migration. The mask sits above STORAGE_FLAG_MASK and below the free high bits.
+// STORAGE_FLAG_COMPRESSED is set. LZ4 is id 0 so volumes written before
+// codec-in-header (when LZ4 was the only codec) keep reading with no migration;
+// this id is a fixed on-disk value, not the runtime default (which is Zstd). The
+// mask sits above STORAGE_FLAG_MASK and below the free high bits.
 constexpr uint8_t STORAGE_CODEC_SHIFT   = 2;
 constexpr uint8_t STORAGE_CODEC_MASK    = 0x1C;   // bits 2,3,4
-constexpr uint8_t STORAGE_CODEC_LZ4     = 0;      // back-compat default
+constexpr uint8_t STORAGE_CODEC_LZ4     = 0;      // fixed on-disk id (pre-codec volumes)
 constexpr uint8_t STORAGE_CODEC_ZSTD    = 1;
 constexpr uint8_t STORAGE_CODEC_DEFLATE = 2;
 
@@ -181,11 +186,11 @@ inline std::string storage_decompress(uint8_t codec, std::string_view data) {
 }
 
 // The codec to write a record with, given the open flags; -1 = no compression.
-// The explicit zstd/deflate selectors win over the plain (LZ4) STORAGE_COMPRESS.
+// If several are set, Zstandard (the default) wins, then Deflate, then LZ4.
 inline int storage_write_codec(int flags) {
 	if (flags & STORAGE_COMPRESS_ZSTD)    { return STORAGE_CODEC_ZSTD; }
 	if (flags & STORAGE_COMPRESS_DEFLATE) { return STORAGE_CODEC_DEFLATE; }
-	if (flags & STORAGE_COMPRESS)         { return STORAGE_CODEC_LZ4; }
+	if (flags & STORAGE_COMPRESS_LZ4)     { return STORAGE_CODEC_LZ4; }
 	return -1;
 }
 

@@ -236,7 +236,7 @@ int main() {
 	{
 		crashio::state().reset();
 		CrashStore w(BASE, nullptr);
-		w.open(REL, STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS | STORAGE_FULL_SYNC);
+		w.open(REL, STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS_LZ4 | STORAGE_FULL_SYNC);
 		for (size_t i = 0; i < recs.size(); ++i) {
 			offs.push_back(w.write(recs[i]));
 			if (i == 2) { w.commit(); committed_after_first = 3; }   // an intermediate commit

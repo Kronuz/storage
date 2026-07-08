@@ -107,11 +107,11 @@ int main() {
 	struct Case { const char* name; const char* vol; size_t size; size_t count; int codec; };
 	const Case cases[] = {
 		{"small blobs, none",    "s_none.0", 256,          50000, 0},
-		{"small blobs, lz4",     "s_lz4.0",  256,          50000, STORAGE_COMPRESS},
+		{"small blobs, lz4",     "s_lz4.0",  256,          50000, STORAGE_COMPRESS_LZ4},
 		{"small blobs, zstd",    "s_zstd.0", 256,          50000, STORAGE_COMPRESS_ZSTD},
 		{"small blobs, deflate", "s_defl.0", 256,          50000, STORAGE_COMPRESS_DEFLATE},
 		{"large blobs, none",    "l_none.0", 1 << 20,         200, 0},
-		{"large blobs, lz4",     "l_lz4.0",  1 << 20,         200, STORAGE_COMPRESS},
+		{"large blobs, lz4",     "l_lz4.0",  1 << 20,         200, STORAGE_COMPRESS_LZ4},
 		{"large blobs, zstd",    "l_zstd.0", 1 << 20,         200, STORAGE_COMPRESS_ZSTD},
 		{"large blobs, deflate", "l_defl.0", 1 << 20,         200, STORAGE_COMPRESS_DEFLATE},
 	};

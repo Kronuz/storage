@@ -5,9 +5,10 @@ from [Xapiand](https://github.com/Kronuz/Xapiand).
 
 It stores opaque binary records in fixed-size blocks inside volume files, returns
 a stable offset for each record, and reads any record back by that offset. Large
-records are transparently LZ4-compressed; every record carries a header and an
-(optional) footer checksum. The on-disk format is **byte-identical** to the
-in-tree Xapiand engine, so existing volumes read unchanged.
+records are transparently compressed (Zstandard by default); every record carries
+a header and an (optional) footer checksum. The on-disk format is
+**byte-identical** to the in-tree Xapiand engine, so existing volumes read
+unchanged.
 
 The engine is one header-only template:
 
@@ -30,7 +31,7 @@ nothing Xapiand-specific.
 using Blobs = Storage<StorageHeader, StorageBinHeader, StorageBinFooter>;
 
 Blobs s("/var/data/", nullptr);
-s.open("vol.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS);
+s.open("vol.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS_ZSTD);
 uint32_t off = s.write("a record");   // returns the offset to read it back
 s.commit();                            // flush + fsync (see the sync flags)
 s.close();
@@ -48,13 +49,13 @@ std::string data = r.read();           // == "a record"
   and roll at a 32-bit block ceiling.
 - **Transparent, multi-codec compression.** Records over
   `STORAGE_MIN_COMPRESS_SIZE` are compressed with the codec the open flags
-  select: `STORAGE_COMPRESS` (LZ4), `STORAGE_COMPRESS_ZSTD` (Zstandard), or
-  `STORAGE_COMPRESS_DEFLATE`. The codec id is stored per-record in the bin
-  header, so reads dispatch automatically and a volume can mix codecs. LZ4 is
-  codec 0, so volumes written before codec-in-header existed keep reading with no
-  migration. See `examples/bench.cc` for a throughput/ratio comparison (on
-  English-like text: zstd ~3.8x at LZ4-class write speed, LZ4 ~1.8x, deflate the
-  best ratio but far slower to write).
+  select: `STORAGE_COMPRESS_ZSTD` (Zstandard, the default), `STORAGE_COMPRESS_LZ4`
+  (LZ4, legacy), or `STORAGE_COMPRESS_DEFLATE` (zlib). The codec id is stored
+  per-record in the bin header, so reads dispatch automatically and a volume can
+  mix codecs. LZ4 is codec 0, so volumes written before codec-in-header existed
+  keep reading with no migration. See `examples/bench.cc` for a throughput/ratio
+  comparison (on English-like text: zstd ~3.8x at LZ4-class write speed, LZ4 ~1.8x,
+  deflate the best ratio but far slower to write).
 - **Integrity.** Each record can carry an XXH32 footer checksum, validated on
   read (the reference `StorageBinFooter` stores none; supply a footer that does).
   A flipped byte surfaces as `StorageCorruptVolume`.

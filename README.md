@@ -1,5 +1,7 @@
 # storage
 
+[![CI](https://github.com/Kronuz/storage/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/storage/actions/workflows/ci.yml)
+
 A compressed, append-only, multi-volume blob store, extracted and modernized
 from [Xapiand](https://github.com/Kronuz/Xapiand).
 

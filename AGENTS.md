@@ -19,7 +19,12 @@ storage_trace.h    No-op L_* logging hooks (redirect via STORAGE_TRACE_HEADER).
 likely.h           Vendored likely()/unlikely() branch hints.
 test/test.cc       ctest: round-trip, multi-volume, checksum, write_file,
                    delete flag, and an 8-thread concurrency case (for TSAN).
+test/test_crash.cc ctest: torn and interrupted commits against the v2 header.
 examples/bench.cc  Runnable throughput / compression-ratio benchmark.
+examples/toy_wal.cc, toy_data_store.cc
+                   Minimal v2 consumers (a WAL and a docstore).
+docs/INTEGRATION.md IO policy, async-fsync hook, logging.
+docs/storage.d2    README diagram; render: d2 --layout elk --sketch --theme 302 docs/storage.d2 docs/storage.svg
 ```
 
 `Error` and `THROW` are NOT defined here: they come from the compressors library

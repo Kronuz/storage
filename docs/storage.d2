@@ -1,0 +1,11 @@
+# storage: one volume file. Render: d2 --layout elk --sketch --theme 302 docs/storage.d2 docs/storage.svg
+direction: right
+w: "write(data)\n→ returns the offset" {shape: oval}
+volume: "vol.0" {
+  grid-columns: 4
+  h: "block 0\nheader\nmagic · txnid · high-water · XXH32"
+  r1: "record\nbin header · data · footer"
+  r2: "record\n(zstd)"
+  free: "fallocated\nfree space" {style.stroke-dash: 3}
+}
+w -> volume: "append at the high-water mark"

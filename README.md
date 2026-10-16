@@ -1,110 +1,107 @@
 # storage
 
 [![CI](https://github.com/Kronuz/storage/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/storage/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
+![Header-only](https://img.shields.io/badge/header--only-yes-green.svg)
 
-A compressed, append-only, multi-volume blob store, extracted and modernized
-from [Xapiand](https://github.com/Kronuz/Xapiand).
+An append-only, compressed, multi-volume blob store for C++20: write a record, get
+back a stable offset, and read it by that offset later. Each record is compressed
+past 100 bytes, checksummed if you want, and committed with the fsync policy you choose.
 
-It stores opaque binary records in fixed-size blocks inside volume files, returns
-a stable offset for each record, and reads any record back by that offset. Large
-records are transparently compressed (Zstandard by default); every record carries
-a header and an (optional) footer checksum. The on-disk format is
-**byte-identical** to the in-tree Xapiand engine, so existing volumes read
-unchanged.
+![storage: a volume is a checksummed header block followed by 8-byte-aligned records](docs/storage.svg)
 
-The engine is one header-only template:
+## ✨ Highlights
 
-```cpp
-template <typename Header, typename BinHeader, typename Footer,
-          typename IO = storage::DefaultIO>
-class Storage;
+- 📎 **Stable offsets**: `write()` appends and returns the record's offset; volumes
+  grow in `fallocate`d chunks up to 32 GiB (2³² 8-byte units).
+- 🗜️ **Per-record codecs**: Zstandard (default), LZ4, or deflate, chosen at open;
+  the codec id lives in each record, so one volume can mix them.
+- 🛡️ **Crash-safe header (v2)**: block 0 carries a magic, a commit counter, and an
+  XXH32 checksum, small enough to survive a torn 4 KB write.
+- 🔎 **Integrity hooks**: your footer type receives an XXH32 of each record and can
+  reject it as `StorageCorruptVolume`.
+- 💾 **Durability flags**: `STORAGE_FULL_SYNC`, `STORAGE_NO_SYNC`, or
+  `STORAGE_ASYNC_SYNC` to hand fsync to your own thread pool.
+- 🧩 **Reads Xapiand volumes**: legacy v1 volumes open unchanged; build with
+  `STORAGE_LEGACY_SUPPORT=0` to drop that path.
+
+## 📦 Installation
+
+Requires a C++20 compiler and a POSIX system; CMake 3.14 or newer. CI builds it on
+Linux (x86_64, arm64), macOS (arm64, x86_64), and FreeBSD, plus ASan, UBSan, and
+TSan builds.
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(storage
+  GIT_REPOSITORY https://github.com/Kronuz/storage.git
+  GIT_TAG        main)
+FetchContent_MakeAvailable(storage)
+
+target_link_libraries(my_app PRIVATE storage::storage)
 ```
 
-`Header`, `BinHeader`, and `Footer` are the on-disk record framing (you supply
-them; init/validate hooks let you add magic, UUIDs, or checksums). `IO` is the
-file-operation policy. Both are injection seams, so the engine itself depends on
-nothing Xapiand-specific.
+Its dependencies ([compressors](https://github.com/Kronuz/compressors),
+[errno-names](https://github.com/Kronuz/errno-names),
+[strict-stox](https://github.com/Kronuz/strict-stox),
+[stringified](https://github.com/Kronuz/stringified)) come along transitively.
+
+## 🚀 Quick start
 
 ```cpp
 #include "storage.h"
 
-// The library's reference framing (offset-only header, flags+size bin header,
-// empty footer). Define your own to add magic / checksums.
+// The reference framing: a v2 header, a flags+size bin header, an empty footer.
 using Blobs = Storage<StorageHeader, StorageBinHeader, StorageBinFooter>;
 
-Blobs s("/var/data/", nullptr);
-s.open("vol.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS_ZSTD);
-uint32_t off = s.write("a record");   // returns the offset to read it back
-s.commit();                            // flush + fsync (see the sync flags)
-s.close();
+int main() {
+	Blobs s("/var/data/", nullptr);
+	s.open("vol.0", STORAGE_CREATE_OR_OPEN | STORAGE_WRITABLE | STORAGE_COMPRESS_ZSTD);
+	uint32_t off = s.write("a record");   // the offset to read it back
+	s.commit();                            // flush + fsync
+	s.close();
 
-Blobs r("/var/data/", nullptr);
-r.open("vol.0", STORAGE_OPEN);
-r.seek(off);
-std::string data = r.read();           // == "a record"
+	Blobs r("/var/data/", nullptr);
+	r.open("vol.0", STORAGE_OPEN);
+	r.seek(off);
+	std::string data = r.read();           // "a record"
+}
 ```
 
-## What you get
+`Header`, `BinHeader`, and `Footer` are template parameters: define your own to add
+magic numbers, UUIDs, or checksums. The fourth parameter routes every file
+operation through your IO policy.
 
-- **Append-only volumes.** `write()` appends a record and returns its offset;
-  `write_file()` appends a file's contents. Volumes grow in `fallocate`d chunks
-  and roll at a 32-bit block ceiling.
-- **Transparent, multi-codec compression.** Records over
-  `STORAGE_MIN_COMPRESS_SIZE` are compressed with the codec the open flags
-  select: `STORAGE_COMPRESS_ZSTD` (Zstandard, the default), `STORAGE_COMPRESS_LZ4`
-  (LZ4, legacy), or `STORAGE_COMPRESS_DEFLATE` (zlib). The codec id is stored
-  per-record in the bin header, so reads dispatch automatically and a volume can
-  mix codecs. LZ4 is codec 0, so volumes written before codec-in-header existed
-  keep reading with no migration. See `examples/bench.cc` for a throughput/ratio
-  comparison (on English-like text: zstd ~3.8x at LZ4-class write speed, LZ4 ~1.8x,
-  deflate the best ratio but far slower to write).
-- **Integrity.** Each record can carry an XXH32 footer checksum, validated on
-  read (the reference `StorageBinFooter` stores none; supply a footer that does).
-  A flipped byte surfaces as `StorageCorruptVolume`.
-- **Multi-volume discovery.** `get_volumes_range("data.")` scans the base
-  directory and returns the lowest/highest volume numbers for a name pattern.
-- **Durability controls.** `STORAGE_FULL_SYNC` (F_FULLFSYNC where available),
-  `STORAGE_NO_SYNC`, and `STORAGE_ASYNC_SYNC` (offload to the host's batched
-  fsync via the hook below).
+## 🎯 When to use it
 
-## The two injection seams
+- ✅ Immutable records addressed by offset: document stores, logs, WAL segments.
+- ❌ Updates or deletes in place: records are never rewritten; compact by copying.
 
-**IO policy (`IO`, the 4th template parameter).** Every file operation routes
-through it: `open/close/lseek/read/write/pread/pwrite/fsync/full_fsync/fallocate/
-fadvise`. The default, `storage::DefaultIO`, is a clean, portable, EINTR-safe
-POSIX layer. A host with its own instrumented IO (retry policy, error injection,
-metrics) passes its own struct with the same 11 static methods. To override the
-default for *all* instantiations at once, point `STORAGE_IO_HEADER` at a header
-that declares your policy type and `#define`s `STORAGE_DEFAULT_IO` to it (so the
-type is in scope before the template default uses it) — Xapiand does exactly
-this to route every storage IO through its `io.cc`.
+## 📚 Documentation
 
-**Async-fsync hook (constructor argument).** By default `commit()` fsyncs
-in-thread. Pass a `StorageFsyncFn` (`void(int fd, bool full_fsync)`) to offload
-it; with `STORAGE_ASYNC_SYNC` set, `commit()` hands the fd to your hook instead
-of blocking on the syscall. Xapiand wires this to a debounced thread pool. With
-no hook installed, `STORAGE_ASYNC_SYNC` degrades to a synchronous fsync.
+- [ARCHITECTURE.md](ARCHITECTURE.md): on-disk layout, write and read paths,
+  durability and failure modes.
+- [docs/INTEGRATION.md](docs/INTEGRATION.md): the IO policy, the async-fsync hook,
+  and logging.
+- [examples/](examples): `toy_wal.cc`, `toy_data_store.cc`, and `bench.cc`
+  (throughput and compression ratio per codec).
+- [AGENTS.md](AGENTS.md): repository map and invariants.
 
-## Logging
-
-The engine emits diagnostics through an `L_*` family that is **no-op by
-default** (`storage_trace.h`), so it has no logging dependency. To route them to
-your logger, define `STORAGE_TRACE_HEADER` to a header that provides the macros,
-or define the `L_*` macros before including `storage.h`.
-
-## Build
+## 🛠️ Building and testing
 
 ```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build          # round-trip, multi-volume, checksum, concurrency
-./build/storage_bench           # write/read throughput + compression ratio
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
+ctest --test-dir build      # round trips, multi-volume, checksums, crashes, v2-only
+./build/storage_bench       # throughput and ratio per codec
 ```
 
-Header-only; consume it via FetchContent and link `storage::storage`. Its
-dependencies (the Kronuz family: `compressors`, `errno-names`, `strict-stox`,
-`stringified`) come along transitively. The test suite is ASAN- and TSAN-clean.
+## 🤝 Contributing
 
-## License
+Issues and pull requests are welcome. Read [AGENTS.md](AGENTS.md) first. CI must
+pass on every platform.
 
-MIT. See the headers.
+## 📄 License
+
+MIT, Copyright (c) 2015-2019 Dubalu LLC. See [LICENSE](LICENSE). Extracted from
+[Xapiand](https://github.com/Kronuz/Xapiand).

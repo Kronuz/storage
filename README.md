@@ -86,6 +86,8 @@ operation through your IO policy.
   durability and failure modes.
 - [docs/INTEGRATION.md](docs/INTEGRATION.md): the IO policy, the async-fsync hook,
   and logging.
+- [docs/mechanisms/streamed-write.md](docs/mechanisms/streamed-write.md): writing one
+  record in chunks (`Storage::StreamWriter`) and reclaiming orphan volumes.
 - [examples/](examples): `toy_wal.cc`, `toy_data_store.cc`, and `bench.cc`
   (throughput and compression ratio per codec).
 - [AGENTS.md](AGENTS.md): repository map and invariants.

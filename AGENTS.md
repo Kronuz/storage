@@ -20,6 +20,9 @@ likely.h           Vendored likely()/unlikely() branch hints.
 test/test.cc       ctest: round-trip, multi-volume, checksum, write_file,
                    delete flag, and an 8-thread concurrency case (for TSAN).
 test/test_crash.cc ctest: torn and interrupted commits against the v2 header.
+test/crashio.h     CrashIO: an in-memory, write-logging IO policy for crash tests.
+test/test_stream.cc ctest: the streamed record write (StreamWriter), orphan reclaim, sparse 4 GiB runs.
+fuzz/              libFuzzer target and replay for the streamed write (-DSTORAGE_FUZZ=ON).
 examples/bench.cc  Runnable throughput / compression-ratio benchmark.
 examples/toy_wal.cc, toy_data_store.cc
                    Minimal v2 consumers (a WAL and a docstore).

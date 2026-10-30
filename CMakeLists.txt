@@ -69,6 +69,34 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(storage_test_crash PRIVATE storage)
 	add_test(NAME storage_crash COMMAND storage_test_crash)
 
+	# The streamed record write: round trips, compatibility with write(), misuse,
+	# abandoned writers, a crash at every write, orphan reclaim. The big case writes
+	# 4 GiB - 1 bytes and records past 4 GiB into sparse files.
+	add_executable(storage_test_stream test/test_stream.cc)
+	target_link_libraries(storage_test_stream PRIVATE storage)
+	add_test(NAME storage_stream COMMAND storage_test_stream)
+	add_test(NAME storage_stream_big COMMAND storage_test_stream big)
+
+	# The same source with a 2 MiB volume cap: a record that cannot fit is refused.
+	add_executable(storage_test_stream_full test/test_stream.cc)
+	target_link_libraries(storage_test_stream_full PRIVATE storage)
+	target_compile_definitions(storage_test_stream_full PRIVATE STREAM_FULL_TEST STORAGE_LAST_BLOCK_OFFSET=2097152)
+	add_test(NAME storage_stream_full COMMAND storage_test_stream_full)
+
+	# libFuzzer target (Clang): cmake -DSTORAGE_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++
+	# The replay binary runs generated inputs through the same target as a test.
+	option(STORAGE_FUZZ "Build the libFuzzer target" OFF)
+	if(STORAGE_FUZZ)
+		add_executable(storage_fuzz fuzz/fuzz_stream.cc)
+		target_link_libraries(storage_fuzz PRIVATE storage)
+		target_compile_options(storage_fuzz PRIVATE -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all)
+		target_link_options(storage_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+
+		add_executable(storage_fuzz_replay fuzz/fuzz_stream.cc fuzz/replay.cc)
+		target_link_libraries(storage_fuzz_replay PRIVATE storage)
+		add_test(NAME storage_fuzz_replay COMMAND storage_fuzz_replay ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus)
+	endif()
+
 	# A runnable benchmark (not a test): ./build/storage_bench
 	add_executable(storage_bench examples/bench.cc)
 	target_link_libraries(storage_bench PRIVATE storage)

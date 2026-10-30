@@ -77,6 +77,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME storage_stream COMMAND storage_test_stream)
 	add_test(NAME storage_stream_big COMMAND storage_test_stream big)
 
+	# The same source with a 2 MiB volume cap: a record that cannot fit is refused.
+	add_executable(storage_test_stream_full test/test_stream.cc)
+	target_link_libraries(storage_test_stream_full PRIVATE storage)
+	target_compile_definitions(storage_test_stream_full PRIVATE STREAM_FULL_TEST STORAGE_LAST_BLOCK_OFFSET=2097152)
+	add_test(NAME storage_stream_full COMMAND storage_test_stream_full)
+
 	# A runnable benchmark (not a test): ./build/storage_bench
 	add_executable(storage_bench examples/bench.cc)
 	target_link_libraries(storage_bench PRIVATE storage)

@@ -260,6 +260,9 @@ static void test_limits_and_misuse() {
 		uint32_t so = w.commit();
 		CHECK_THROWS(w.append("x"), StorageException);                        // a committed writer is spent
 		st.seek(so); CHECK(st.read() == "1234567890");
+		DStore other(dir, nullptr);   // published: another opener reads it now
+		other.open("m", STORAGE_OPEN);
+		other.seek(so); CHECK(other.read() == "1234567890");
 	}
 	// The storage takes write() again.
 	uint32_t o2 = st.write("again");
@@ -592,7 +595,35 @@ static void test_big() {
 }  // namespace sparse
 
 
+#ifdef STREAM_FULL_TEST
+// A volume of 2 MiB (-DSTORAGE_LAST_BLOCK_OFFSET): a record that cannot end below
+// the last block is refused at begin, before anything is written.
+static void test_volume_full() {
+	auto dir = make_dir("full");
+	DStore st(dir, nullptr);
+	st.open("f", WR);
+	CHECK_THROWS(DStore::StreamWriter(st, 2u << 20), StorageEOF);
+	CHECK_THROWS(DStore::StreamWriter(st, (2u << 20) - 4096), StorageEOF);
+	CHECK(std::filesystem::file_size(dir + "f") == 4096);   // only the header block
+	uint32_t a = stream_in(st, 1u << 20, 65536, false, 1);
+	CHECK_THROWS(DStore::StreamWriter(st, (1u << 20) + 4096), StorageEOF);   // what is left is smaller
+	uint32_t b = stream_in(st, 900000, 65536, false, 2);
+	CHECK(reads_back(st, a, 1u << 20, 1));
+	CHECK(reads_back(st, b, 900000, 2));
+	CHECK_THROWS(DStore::StreamWriter(st, 200000), StorageEOF);
+	uint32_t c = stream_in(st, 100, 10, false, 3);
+	CHECK(reads_back(st, c, 100, 3));
+	std::filesystem::remove_all(dir);
+}
+#endif
+
 int main(int argc, char** argv) {
+#ifdef STREAM_FULL_TEST
+	test_volume_full();
+	if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
+	std::printf("ok\n");
+	return 0;
+#endif
 	if (argc > 1 && std::string(argv[1]) == "big") {
 		sparse::test_big();
 	} else {

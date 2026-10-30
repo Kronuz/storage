@@ -123,7 +123,9 @@
 #define STORAGE_BLOCKS_GROWTH_FACTOR 1.3f
 #define STORAGE_BLOCKS_MIN_FREE 4
 
+#ifndef STORAGE_LAST_BLOCK_OFFSET  // overridable, so a test can fill a volume cheaply
 #define STORAGE_LAST_BLOCK_OFFSET (static_cast<off_t>(std::numeric_limits<uint32_t>::max()) * STORAGE_ALIGNMENT)
+#endif
 
 #define STORAGE_START_BLOCK_OFFSET (STORAGE_BLOCK_SIZE / STORAGE_ALIGNMENT)
 

@@ -37,6 +37,7 @@
 #include <type_traits>           // for the v2-header detection trait (if constexpr)
 #include <utility>               // for std::declval
 #include <vector>
+#include <sys/stat.h>            // for stat, fstatat (reclaim)
 #include <unistd.h>
 
 #include "compressor_lz4.h"      // for compress_lz4 / decompress_lz4 + XXH32 (compressors lib)
@@ -143,7 +144,7 @@ constexpr int STORAGE_OPEN             = 0x00;  // Open an existing database.
 constexpr int STORAGE_WRITABLE         = 0x01;  // Opens as writable.
 constexpr int STORAGE_CREATE           = 0x02;  // Automatically creates the database if it doesn't exist
 constexpr int STORAGE_CREATE_OR_OPEN   = 0x03;  // Create database if it doesn't already exist.
-constexpr int STORAGE_ASYNC_SYNC       = 0x04;  // fsync (or full_fsync) is async
+constexpr int STORAGE_ASYNC_SYNC       = 0x04;  // fsync (or full_fsync) is async: commit() returns before the data is durable, so never use it for a record acknowledged to a client
 constexpr int STORAGE_FULL_SYNC        = 0x08;  // Try to ensure changes are really written to disk.
 constexpr int STORAGE_NO_SYNC          = 0x10;  // Don't attempt to ensure changes have hit disk.
 constexpr int STORAGE_COMPRESS_LZ4     = 0x20;  // Compress with LZ4 (legacy: fastest, lowest ratio).
@@ -196,6 +197,21 @@ inline int storage_write_codec(int flags) {
 	if (flags & STORAGE_COMPRESS_DEFLATE) { return STORAGE_CODEC_DEFLATE; }
 	if (flags & STORAGE_COMPRESS_LZ4)     { return STORAGE_CODEC_LZ4; }
 	return -1;
+}
+
+// Volume locks and truncation: the IO policy's own when it defines them (storage::DefaultIO does;
+// the crash-test policy fakes them), else the POSIX calls on the real descriptor.
+template <typename IO> inline int storage_lock_shared(int fd) noexcept {
+	if constexpr (requires { IO::lock_shared(fd); }) { return IO::lock_shared(fd); }
+	else { return ::storage::posix::lock_shared(fd); }
+}
+template <typename IO> inline int storage_lock_exclusive(int fd) noexcept {
+	if constexpr (requires { IO::lock_exclusive(fd); }) { return IO::lock_exclusive(fd); }
+	else { return ::storage::posix::lock_exclusive(fd); }
+}
+template <typename IO> inline int storage_ftruncate(int fd, off_t len) noexcept {
+	if constexpr (requires { IO::ftruncate(fd, len); }) { return IO::ftruncate(fd, len); }
+	else { return ::storage::posix::ftruncate(fd, len); }
 }
 
 
@@ -443,6 +459,8 @@ class Storage {
 	uint32_t bin_hash;
 
 	bool changed;
+	bool dir_sync_pending = false;  // the volume file was created: its directory entry needs an fsync
+	bool _no_grow = false;          // a streamed commit's file is exactly sized: no preallocation
 
 	// ---- v1/v2 seam ------------------------------------------------------------
 	// hw_offset is the authoritative committed high-water mark (in STORAGE_ALIGNMENT
@@ -644,6 +662,30 @@ public:
 		seek(STORAGE_START_BLOCK_OFFSET);
 	}
 
+	// Opens a volume file. A writable open holds a shared advisory lock for as long as the
+	// descriptor lives, so reclaim_volumes() (which needs the exclusive one) skips the volume. A
+	// reclaim in progress fails the open with EWOULDBLOCK; a file unlinked between the open and
+	// the lock is opened again.
+	int open_fd(const std::string& file, int oflag, bool writable) {
+		for (int attempt = 0; attempt < 4; ++attempt) {
+			int f = IO::open(file.c_str(), oflag, 0644);
+			if (f == -1 || !writable) {
+				return f;
+			}
+			if (storage_lock_shared<IO>(f) == 0) {
+				return f;
+			}
+			int err = errno;
+			IO::close(f);
+			if (err != ESTALE) {
+				errno = err;
+				return -1;
+			}
+		}
+		errno = ESTALE;
+		return -1;
+	}
+
 	bool open(std::string_view relative_path, int flags_=STORAGE_CREATE_OR_OPEN, void* args=nullptr) {
 		L_CALL("Storage::open({}, {}, <args>)", repr(relative_path), flags_);
 
@@ -663,14 +705,14 @@ public:
 			}
 #endif
 
-			fd = IO::open(path.c_str(), (flags & STORAGE_WRITABLE) ? O_RDWR : O_RDONLY, 0644);
+			fd = open_fd(path, (flags & STORAGE_WRITABLE) ? O_RDWR : O_RDONLY, (flags & STORAGE_WRITABLE) != 0);
 			if unlikely(fd == -1 || IO::lseek(fd, 0, SEEK_END) == 0) {
 				if (fd != -1) {
 					IO::close(fd);
 					fd = -1;
 				}
 				if (flags & STORAGE_CREATE) {
-					fd = IO::open(path.c_str(), (flags & STORAGE_WRITABLE) ? O_RDWR | O_CREAT : O_RDONLY | O_CREAT, 0644);
+					fd = open_fd(path, (flags & STORAGE_WRITABLE) ? O_RDWR | O_CREAT : O_RDONLY | O_CREAT, (flags & STORAGE_WRITABLE) != 0);
 					if unlikely(fd == -1) {
 						close();
 						L_ERR("IO error in {}: open: {} ({}): {}", repr(path.empty() ? base_path : path), error::name(errno), errno, error::description(errno));
@@ -678,6 +720,7 @@ public:
 					}
 					initialize_file(args);
 					created = true;
+					dir_sync_pending = (flags & STORAGE_WRITABLE) != 0;
 				}
 				return created;
 			}
@@ -816,6 +859,8 @@ public:
 		hw_offset = 0;
 		vol_format = is_v2 ? 2 : 1;
 		meta_txnid = 0;
+		dir_sync_pending = false;
+		_no_grow = false;
 		path.clear();
 	}
 
@@ -895,7 +940,7 @@ public:
 		uint32_t tmp_buffer_offset = buffer_offset;
 		StorageBinHeader* buffer_header = reinterpret_cast<StorageBinHeader*>(buffer + tmp_buffer_offset);
 
-		off_t block_offset = ((curr_offset * STORAGE_ALIGNMENT) / STORAGE_BLOCK_SIZE) * STORAGE_BLOCK_SIZE;
+		off_t block_offset = static_cast<off_t>((static_cast<uint64_t>(curr_offset) * STORAGE_ALIGNMENT) / STORAGE_BLOCK_SIZE * STORAGE_BLOCK_SIZE);
 		off_t tmp_block_offset = block_offset;
 
 		while (bin_header_data_size) {
@@ -1146,6 +1191,28 @@ public:
 		}
 	}
 
+	// fsync the volume directory once after the file was created, so the record a commit
+	// acknowledges cannot vanish with its directory entry.
+	void sync_dir() {
+		if (!dir_sync_pending || (flags & STORAGE_NO_SYNC)) {
+			return;
+		}
+		int dfd = IO::open(base_path.c_str(), O_RDONLY, 0);
+		if (dfd == -1) {
+			return;  // no directory to sync (an in-memory policy)
+		}
+		bool full = (flags & STORAGE_FULL_SYNC) != 0;
+		int r = full ? IO::full_fsync(dfd) : IO::fsync(dfd);
+		int err = errno;
+		IO::close(dfd);
+		if unlikely(r == -1 && err != EINVAL && err != ENOTSUP && err != EBADF) {
+			close();
+			L_ERR("IO error in {}: fsync directory: {} ({}): {}", repr(path.empty() ? base_path : path), error::name(err), err, error::description(err));
+			THROW(StorageIOError, error::description(err));
+		}
+		dir_sync_pending = false;
+	}
+
 	void commit() {
 		L_CALL("Storage::commit()");
 
@@ -1178,6 +1245,7 @@ public:
 			// consumer whose header spans sectors and can tear (the WAL) gets a
 			// checksum failure on the next open and quarantines.
 			do_sync();
+			sync_dir();     // a new volume's directory entry is durable before the header names it
 			write_meta();   // bumps meta_txnid, stamps high-water + checksum
 			do_sync();
 		} else {
@@ -1188,9 +1256,12 @@ public:
 				THROW(StorageIOError, error::description(errno));
 			}
 			do_sync();
+			sync_dir();
 		}
 
-		growfile();
+		if (!_no_grow) {
+			growfile();
+		}
 	}
 
 	uint32_t write(std::string_view data, void* args=nullptr) {
@@ -1232,6 +1303,7 @@ public:
 		uint32_t offset_;                 // the record's offset, in alignment units
 		off_t block_offset;               // file offset of the block being filled
 		int saved_free_blocks;
+		off_t saved_file_size = -1;       // the file's size before the preallocation, -1: none made
 		uint32_t saved_buffer_offset;
 		char saved_block[STORAGE_BLOCK_SIZE];
 		compressors::XXH32_state_t xxh;
@@ -1319,6 +1391,25 @@ public:
 				THROW(StorageEOF, "Storage EOF");
 			}
 
+			// Reserve the record's whole extent now (the tail block included), so a full
+			// disk refuses the upload before its first byte and the file ends up exactly
+			// the record's size.
+			off_t file_size = IO::lseek(st.fd, 0, SEEK_END);
+			off_t needed = static_cast<off_t>((start + sizeof(StorageBinHeader) + size + sizeof(StorageBinFooter)
+				+ STORAGE_BLOCK_SIZE - 1) / STORAGE_BLOCK_SIZE * STORAGE_BLOCK_SIZE);
+			if (file_size != -1 && file_size < needed) {
+				if (IO::fallocate(st.fd, 0, file_size, needed - file_size) == -1) {
+					int err = errno;
+					storage_ftruncate<IO>(st.fd, file_size);
+					if (err != EOPNOTSUPP && err != ENOSYS && err != EINVAL) {
+						L_ERR("IO error in {}: fallocate: {} ({}): {}", repr(st.path.empty() ? st.base_path : st.path), error::name(err), err, error::description(err));
+						THROW(StorageIOError, error::description(err));
+					}
+				} else {
+					saved_file_size = file_size;
+				}
+			}
+
 			offset_ = static_cast<uint32_t>(st.hw_offset);
 			block_offset = static_cast<off_t>(start / STORAGE_BLOCK_SIZE * STORAGE_BLOCK_SIZE);
 			saved_free_blocks = st.free_blocks;
@@ -1397,7 +1488,14 @@ public:
 			}
 			st.changed = true;
 			st._stream = nullptr;
-			st.commit();
+			st._no_grow = true;  // the file is exactly the record's size
+			try {
+				st.commit();
+			} catch (...) {
+				st._no_grow = false;
+				throw;
+			}
+			st._no_grow = false;
 			return offset_;
 		}
 
@@ -1407,6 +1505,9 @@ public:
 				return;
 			}
 			st._stream = nullptr;
+			if (saved_file_size >= 0) {
+				storage_ftruncate<IO>(st.fd, saved_file_size);  // give back the reservation
+			}
 			memcpy(st.buffer_curr, saved_block, STORAGE_BLOCK_SIZE);
 			st.buffer_offset = saved_buffer_offset;
 			st.free_blocks = saved_free_blocks;
@@ -1417,37 +1518,74 @@ private:
 	StreamWriter* _stream = nullptr;  // the open streamed write, if any
 
 public:
-	// Crash recovery for streamed writes, run at open before any writer exists.
-	// Removes the volume files "<pattern><n>" of base_path that hold no published
-	// record (a writer died before commit: a header with the initial high-water
-	// mark, or no header at all), and those `keep(n)` rejects, asked only about
-	// volumes whose v2 header shows records (the host knows which of them a
-	// committed locator names). Volumes it cannot read as such, legacy v1 ones
-	// among them, are left alone and not asked about. Returns the removed numbers.
+	// The volume number in a file name: `pattern`, a '.' (unless the pattern ends with one), then
+	// decimal digits with no sign, space or leading zero ("data.7", not "data.007", "data.+7",
+	// "data.bak.7" or "database.7").
+	static bool volume_number(std::string_view pattern, std::string_view name, unsigned long long& n) {
+		if (name.size() <= pattern.size() || name.compare(0, pattern.size(), pattern) != 0) {
+			return false;
+		}
+		auto rest = name.substr(pattern.size());
+		if (pattern.empty() || pattern.back() != '.') {
+			if (rest.front() != '.') {
+				return false;
+			}
+			rest.remove_prefix(1);
+		}
+		if (rest.empty() || (rest.size() > 1 && rest.front() == '0')) {
+			return false;
+		}
+		for (char c : rest) {
+			if (c < '0' || c > '9') {
+				return false;
+			}
+		}
+		int errno_save;
+		n = static_cast<unsigned long long>(strict_stoull(&errno_save, rest));
+		return errno_save == 0;
+	}
+
+	// Whether a directory entry is a regular file; some filesystems report DT_UNKNOWN, then ask.
+	static bool is_regular_entry(int dirfd, const char* name, unsigned char d_type) {
+		if (d_type == DT_REG) {
+			return true;
+		}
+		if (d_type != DT_UNKNOWN) {
+			return false;
+		}
+		struct stat sb;
+		return ::fstatat(dirfd, name, &sb, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(sb.st_mode);
+	}
+
+	// Crash recovery for streamed writes. Removes the volume files "<pattern><n>" of base_path
+	// that hold no published record (a writer died before commit: a header with the initial
+	// high-water mark, or no header at all), and those `keep(n)` rejects, asked only about
+	// volumes whose v2 header shows records. `keep` must be true for every volume a committed
+	// locator names and every one a journal or unapplied batch can still replay; the library
+	// cannot know. Volumes it cannot read as ours, legacy v1 ones among them, are left alone.
+	//
+	// A volume a writable Storage has open (an upload in flight, a committed record not yet
+	// named) holds a shared lock; reclaim takes the exclusive one before it reads or unlinks, so
+	// it skips such a volume, and keeps the lock until the unlink is done. Where the filesystem
+	// has no advisory locks nothing is removed. Returns the removed numbers.
 	std::vector<unsigned long long>
 	reclaim_volumes(std::string_view pattern, const std::function<bool(unsigned long long)>& keep = nullptr) {
 		L_CALL("Storage::reclaim_volumes()");
 
 		DIR* dir = ::opendir(base_path.c_str());
 		if (dir == nullptr) {
-			THROW(StorageNotFound, "Couldn't open storage directory");
+			int err = errno;
+			L_DEBUG("Could not open the directory {}: {} ({}): {}", repr(base_path), error::name(err), err, error::description(err));
+			if (err == ENOENT || err == ENOTDIR) {
+				THROW(StorageNotFound, "Couldn't open storage directory");
+			}
+			THROW(StorageIOError, error::description(err));
 		}
 		std::vector<std::pair<unsigned long long, std::string>> found;
 		while (struct dirent* ent = ::readdir(dir)) {
-			if (ent->d_type != DT_REG) {
-				continue;
-			}
-			std::string_view filename(ent->d_name);
-			if (filename.size() < pattern.size() || filename.compare(0, pattern.size(), pattern) != 0) {
-				continue;
-			}
-			auto dot = filename.find_last_of(".");
-			if (dot != std::string_view::npos) {
-				int errno_save;
-				auto n = static_cast<unsigned long long>(strict_stoull(&errno_save, filename.substr(dot + 1)));
-				if (errno_save == 0) {
-					found.emplace_back(n, std::string(filename));
-				}
+			unsigned long long n;
+			if (is_regular_entry(::dirfd(dir), ent->d_name, ent->d_type) && volume_number(pattern, ent->d_name, n)) {
+				found.emplace_back(n, std::string(ent->d_name));
 			}
 		}
 		::closedir(dir);
@@ -1456,7 +1594,15 @@ public:
 		std::vector<unsigned long long> removed;
 		for (const auto& [n, name] : found) {
 			auto full = base_path + name;
-			auto state = volume_state(full);
+			int f = IO::open(full.c_str(), O_RDONLY, 0644);
+			if (f == -1) {
+				continue;
+			}
+			struct Closer { int f; ~Closer() { IO::close(f); } } closer{f};
+			if (storage_lock_exclusive<IO>(f) == -1) {
+				continue;  // in use, or already gone
+			}
+			auto state = volume_state(f);
 			if (state == VolumeState::Empty || (state == VolumeState::HoldsRecords && keep && !keep(n))) {
 				if (::unlink(full.c_str()) == 0) {
 					removed.push_back(n);
@@ -1469,22 +1615,17 @@ public:
 private:
 	enum class VolumeState { Empty, HoldsRecords, Unknown };
 
-	static VolumeState volume_state(const std::string& file) {
-		int f = IO::open(file.c_str(), O_RDONLY, 0644);
-		if (f == -1) {
-			return VolumeState::Unknown;
-		}
-		auto state = VolumeState::Unknown;
+	static VolumeState volume_state(int f) {
 		if (IO::lseek(f, 0, SEEK_END) == 0) {
-			state = VolumeState::Empty;  // created, header never written
-		} else if constexpr (is_v2) {
+			return VolumeState::Empty;  // created, header never written
+		}
+		if constexpr (is_v2) {
 			StorageHeader h;
 			if (read_meta(f, h)) {
-				state = h.meta.offset == STORAGE_START_BLOCK_OFFSET ? VolumeState::Empty : VolumeState::HoldsRecords;
+				return h.meta.offset == STORAGE_START_BLOCK_OFFSET ? VolumeState::Empty : VolumeState::HoldsRecords;
 			}
 		}
-		IO::close(f);
-		return state;
+		return VolumeState::Unknown;
 	}
 
 public:

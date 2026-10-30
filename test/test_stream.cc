@@ -585,8 +585,11 @@ static void test_big() {
 		w.open("max", WR);
 		CHECK_THROWS(SStore::StreamWriter(w, SStore::stream_max_size + 1), StorageTooLarge);
 		uint32_t off = stream_big(w, SStore::stream_max_size);
-		// Commit asks to preallocate past the 4 GiB file (the size arithmetic is 64-bit).
-		CHECK(SparseIO::last_grow_end > static_cast<off_t>(SStore::stream_max_size) + 4096);
+		// The record's extent is reserved once, at begin: the file is that long and the
+		// commit does not preallocate beyond it.
+		auto extent = static_cast<off_t>((4096 + sizeof(SBinHeader) + SStore::stream_max_size + sizeof(SBinFooter) + 4095) / 4096 * 4096);
+		CHECK(SparseIO::last_grow_end == extent);
+		CHECK(static_cast<off_t>(std::filesystem::file_size(dir + "max")) == extent);
 		w.close();
 		SStore r(dir, nullptr);
 		r.open("max", STORAGE_OPEN);
@@ -607,6 +610,12 @@ static void test_big() {
 		w.open("far", WR);
 		uint32_t o1 = stream_big(w, big), o2 = stream_big(w, big), o3 = stream_big(w, big);
 		uint32_t o4 = stream_big(w, 5000), o5 = stream_big(w, 3);
+		// A plain write() past 4 GiB commits and may grow the file (the size arithmetic is 64-bit).
+		auto before = std::filesystem::file_size(dir + "far");
+		SparseIO::last_grow_end = 0;
+		uint32_t o6 = w.write(payload(100, 6));
+		w.commit();
+		CHECK(SparseIO::last_grow_end > static_cast<off_t>(before));
 		w.close();
 		CHECK(static_cast<uint64_t>(o4) * 8 > (4ull << 30));
 		SStore r(dir, nullptr);
@@ -616,11 +625,232 @@ static void test_big() {
 		CHECK(big_reads_back(r, o3, big));
 		CHECK(big_reads_back(r, o4, 5000));
 		CHECK(big_reads_back(r, o5, 3));
+		r.seek(o6); CHECK(r.read() == payload(100, 6));
 	}
 	std::filesystem::remove_all(dir);
 }
 }  // namespace sparse
 
+
+
+// ---- the volume lock: reclaim never takes a volume a writer holds (L6-B1) ----------
+static void test_reclaim_vs_live_writer() {
+	auto dir = make_dir("live");
+	// An upload in flight on a fresh volume: reclaim finds a header-only file and must leave it.
+	{
+		DStore w(dir, nullptr);
+		w.open("data.5", WR);
+		DStore h(dir, nullptr);
+		CHECK(h.reclaim_volumes("data.", [](unsigned long long) { return false; }).empty());
+		CHECK(std::filesystem::exists(dir + "data.5"));
+		uint32_t off = stream_in(w, 9000, 4000, false, 2);
+		CHECK(std::filesystem::exists(dir + "data.5"));
+		DStore r(dir, nullptr);
+		r.open("data.5", STORAGE_OPEN);
+		CHECK(reads_back(r, off, 9000, 2));
+	}
+	// Mid-upload, between two chunks.
+	{
+		DStore w(dir, nullptr);
+		w.open("data.1", WR);
+		DStore::StreamWriter sw(w, 6000);
+		auto p = payload(6000, 3);
+		sw.append(p.data(), 3000);
+		DStore h(dir, nullptr);
+		CHECK(h.reclaim_volumes("data.", [](unsigned long long n) { return n == 5; }).empty());
+		sw.append(p.data() + 3000, 3000);
+		uint32_t off = sw.commit();
+		// Committed but not yet named, and still open by the writer: still kept.
+		CHECK(h.reclaim_volumes("data.", [](unsigned long long n) { return n == 5; }).empty());
+		CHECK(std::filesystem::exists(dir + "data.1"));
+		DStore r(dir, nullptr);
+		r.open("data.1", STORAGE_OPEN);
+		CHECK(reads_back(r, off, 6000, 3));
+	}
+	// Once the writers are closed, the unnamed volumes go.
+	{
+		DStore h(dir, nullptr);
+		auto removed = h.reclaim_volumes("data.", [](unsigned long long) { return false; });
+		CHECK((removed == std::vector<unsigned long long>{1, 5}));
+	}
+	// A reclaim holding a volume turns a writable open away instead of letting it be unlinked.
+	{
+		{ DStore s(dir, nullptr); s.open("data.2", WR); }
+		int f = ::open((dir + "data.2").c_str(), O_RDONLY);
+		CHECK(f != -1);
+		CHECK(::storage::posix::lock_exclusive(f) == 0);
+		DStore w(dir, nullptr);
+		CHECK_THROWS(w.open("data.2", WR), StorageIOError);
+		::close(f);
+		w.open("data.2", WR);   // free again
+	}
+	std::filesystem::remove_all(dir);
+}
+
+
+// ---- reclaim touches only exact volume names (L6-N3) ---------------------------------
+static void test_volume_names() {
+	unsigned long long n = 99;
+	CHECK(DStore::volume_number("data", "data.7", n) && n == 7);
+	CHECK(DStore::volume_number("data.", "data.0", n) && n == 0);
+	CHECK(DStore::volume_number("data.", "data.1234567890", n) && n == 1234567890ull);
+	for (const char* bad : {"database.4", "data_backup.9", "data.bak.7", "data.+8", "data. 6", "data.007", "data.-1",
+	                        "data.", "data", "data.7x", "data.99999999999999999999", "data.0x7", "xdata.7", "data.7.bak", "data7"}) {
+		if (DStore::volume_number("data", bad, n)) { std::printf("FAIL: %s matched pattern data\n", bad); ++failures; }
+	}
+	CHECK(!DStore::volume_number("data.", "data.007", n));
+	CHECK(!DStore::volume_number("data.", "data..7", n));
+
+	auto dir = make_dir("names");
+	for (const char* f : {"data.3", "database.4", "data_backup.9", "data.bak.7", "data.+8", "data.007", "data.-1"}) {
+		std::ofstream(dir + f);   // empty files: removable if the name matched
+	}
+	DStore h(dir, nullptr);
+	CHECK((h.reclaim_volumes("data") == std::vector<unsigned long long>{3}));
+	for (const char* f : {"database.4", "data_backup.9", "data.bak.7", "data.+8", "data.007", "data.-1"}) {
+		CHECK(std::filesystem::exists(dir + f));
+	}
+	CHECK(!std::filesystem::exists(dir + "data.3"));
+
+	// DT_UNKNOWN (a filesystem that does not say) asks the file itself.
+	int dfd = ::open(dir.c_str(), O_RDONLY);
+	std::filesystem::create_directory(dir + "dir.1");
+	std::filesystem::create_symlink("data.-1", dir + "link.1");
+	CHECK(DStore::is_regular_entry(dfd, "data.007", DT_UNKNOWN));
+	CHECK(!DStore::is_regular_entry(dfd, "dir.1", DT_UNKNOWN));
+	CHECK(!DStore::is_regular_entry(dfd, "link.1", DT_UNKNOWN));
+	CHECK(!DStore::is_regular_entry(dfd, "data.007", DT_DIR));
+	CHECK(DStore::is_regular_entry(dfd, "whatever", DT_REG));
+	::close(dfd);
+	std::filesystem::remove_all(dir);
+}
+
+
+// ---- the directory is synced once, after the data and before the header (L6-N1) -------
+struct EventIO : ::storage::DefaultIO {
+	static inline std::vector<std::string> events;
+	static void note(int fd) noexcept {
+		struct stat sb;
+		events.push_back(::fstat(fd, &sb) == 0 && S_ISDIR(sb.st_mode) ? "dir" : "file");
+	}
+	static int fsync(int fd) noexcept { note(fd); return ::storage::DefaultIO::fsync(fd); }
+	static int full_fsync(int fd) noexcept { note(fd); return ::storage::DefaultIO::full_fsync(fd); }
+};
+using EStore = Store<EventIO>;
+
+static void test_directory_sync() {
+	auto dir = make_dir("dirsync");
+	{
+		EStore w(dir, nullptr);
+		w.open("v", WR);
+		EventIO::events.clear();
+		EStore::StreamWriter sw(w, 100);
+		sw.append(payload(100, 1));
+		sw.commit();
+		CHECK((EventIO::events == std::vector<std::string>{"file", "dir", "file"}));   // data, directory, header
+		EventIO::events.clear();
+		w.write("more");
+		w.commit();
+		CHECK((EventIO::events == std::vector<std::string>{"file", "file"}));          // the directory once only
+	}
+	{
+		EStore w(dir, nullptr);
+		w.open("v", WR);   // an existing volume: nothing new to sync
+		EventIO::events.clear();
+		w.write("again");
+		w.commit();
+		CHECK((EventIO::events == std::vector<std::string>{"file", "file"}));
+	}
+	{
+		EStore w(dir, nullptr);   // an ordinary write() on a new volume pays it too
+		w.open("w", WR);
+		EventIO::events.clear();
+		w.write("first");
+		w.commit();
+		CHECK((EventIO::events == std::vector<std::string>{"file", "dir", "file"}));
+	}
+	std::filesystem::remove_all(dir);
+}
+
+
+// ---- exact preallocation (L6-N4) ----------------------------------------------------
+struct FullDiskIO : ::storage::DefaultIO {
+	static inline int err = ENOSPC;
+	static int fallocate(int, int, off_t, off_t) noexcept { errno = err; return -1; }
+};
+using FStore = Store<FullDiskIO>;
+
+static void test_preallocation() {
+	auto dir = make_dir("prealloc");
+	auto extent = [](uint64_t size) { return (4096 + sizeof(SBinHeader) + size + sizeof(SBinFooter) + 4095) / 4096 * 4096; };
+	// The file ends exactly where the record does: no 30% growth after the commit.
+	for (uint64_t size : {0ull, 100ull, 4085ull, 100000ull, 3000000ull}) {
+		DStore w(dir, nullptr);
+		w.open("e", WR);
+		uint32_t off = stream_in(w, size, 70000, false, 5);
+		CHECK(std::filesystem::file_size(dir + "e") == extent(size));
+		CHECK(reads_back(w, off, size, 5));
+		std::filesystem::remove(dir + "e");
+	}
+	// An abandoned stream gives the reservation back.
+	{
+		DStore w(dir, nullptr);
+		w.open("a", WR);
+		CHECK(std::filesystem::file_size(dir + "a") == 4096);
+		{
+			DStore::StreamWriter sw(w, 1000000);
+			sw.append(payload(300000, 1));
+			CHECK(std::filesystem::file_size(dir + "a") >= extent(1000000));
+		}
+		CHECK(std::filesystem::file_size(dir + "a") == 4096);
+		uint32_t o = w.write("after");
+		w.commit();
+		w.seek(o); CHECK(w.read() == "after");
+	}
+	// A later write() on a streamed volume still grows it as before.
+	{
+		DStore w(dir, nullptr);
+		w.open("g", WR);
+		stream_in(w, 50000, 4096, false, 1);
+		auto sz = std::filesystem::file_size(dir + "g");
+		for (int i = 0; i < 6; ++i) { w.write(payload(3000, i)); w.commit(); }
+		CHECK(std::filesystem::file_size(dir + "g") > sz);
+	}
+	// A full disk refuses the upload at begin, with the file as it was and the storage usable.
+	{
+		FStore w(dir, nullptr);
+		w.open("f", WR);
+		CHECK_THROWS(FStore::StreamWriter(w, 100000), StorageIOError);
+		CHECK(std::filesystem::file_size(dir + "f") == 4096);
+		uint32_t o = w.write("still works");
+		w.commit();
+		w.seek(o); CHECK(w.read() == "still works");
+		// A filesystem without fallocate only loses the reservation.
+		FullDiskIO::err = EOPNOTSUPP;
+		uint32_t so;
+		{
+			FStore::StreamWriter sw(w, 6000);
+			sw.append(payload(6000, 4));
+			so = sw.commit();
+		}
+		FullDiskIO::err = ENOSPC;
+		CHECK(reads_back(w, so, 6000, 4));
+	}
+	// fallocate reserves len bytes, not offset + len (macOS counted from the allocated end).
+	{
+		constexpr off_t size = 8 << 20;
+		int fd = ::open((dir + "fa").c_str(), O_RDWR | O_CREAT, 0644);
+		std::vector<char> block(1 << 20, 'x');
+		for (off_t at = 0; at < size; at += block.size()) { CHECK(::pwrite(fd, block.data(), block.size(), at) == (ssize_t)block.size()); }
+		CHECK(::storage::DefaultIO::fallocate(fd, 0, size, size / 4) == 0);
+		struct stat sb;
+		::fstat(fd, &sb);
+		CHECK(sb.st_size == size + size / 4);
+		CHECK(static_cast<off_t>(sb.st_blocks) * 512 <= size + size / 4 + (1 << 20));
+		::close(fd);
+	}
+	std::filesystem::remove_all(dir);
+}
 
 #ifdef STREAM_FULL_TEST
 // A volume of 2 MiB (-DSTORAGE_LAST_BLOCK_OFFSET): a record that cannot end below
@@ -661,6 +891,10 @@ int main(int argc, char** argv) {
 		test_abandon();
 		test_crash_sweep();
 		test_reclaim();
+		test_reclaim_vs_live_writer();
+		test_volume_names();
+		test_directory_sync();
+		test_preallocation();
 	}
 	if (failures) {
 		std::printf("%d failure(s)\n", failures);

@@ -56,14 +56,50 @@ high-water mark; the next write overwrites them. `Storage::close()` detaches a l
 its later calls throw `StorageClosedError`. While a writer is open, `write()` and `reopen()`
 throw, and a second writer is refused: the host streams into a volume of its own.
 
+## Durability: what commit() promises
+
+`commit()` returns after three steps, each complete before the next: fsync the data, fsync the
+volume's directory (once, when the storage created the file, so the record cannot vanish with
+its directory entry), then write and fsync the header. This holds only with the synchronous
+open flags. With `STORAGE_ASYNC_SYNC` and a host hook, the hook is handed each fsync and
+`commit()` returns before either completes, so the order is the hook's job and the record is
+not durable on return: do not use that flag for an upload that is acknowledged to a client, or
+wait for the hook's completion. `STORAGE_NO_SYNC` skips all of it.
+
+A failed `append` (a full disk, an IO error) closes the storage: the bytes of the abandoned
+record are dropped, earlier committed records stay, and every later call throws
+`StorageClosedError`.
+
+## Preallocation
+
+`begin` reserves the record's whole extent, the tail block included, with `fallocate`, after the
+room check and before the first byte. A full disk (`ENOSPC`, `EDQUOT`, `EFBIG`) throws
+`StorageIOError` there, with the file as it was; a filesystem without `fallocate` only loses the
+reservation. The stream's own `commit` skips the 30% preallocation `commit()` otherwise does,
+so the file ends exactly at the record; a later `write()` on the volume grows it as usual.
+`abort()` truncates the file back to its size before `begin`.
+
 ## Orphans
 
 A crash mid-upload leaves a volume file whose header still holds the initial mark (or no
 header). A crash after `commit` but before the host names the record leaves a volume with a
-record nobody references. `Storage::reclaim_volumes(pattern, keep)` runs at open, before any
-writer: it unlinks volumes holding no record, and volumes holding records that `keep(n)`
-rejects (the host knows which volumes its committed locators name). Files whose header is not a
-valid v2 header, legacy v1 volumes among them, are never removed or offered to `keep`.
+record nobody references. `Storage::reclaim_volumes(pattern, keep)` unlinks volumes holding no
+record, and volumes holding records that `keep(n)` rejects. `keep(n)` must be true for every
+volume a committed locator names and every one a journal or unapplied batch can still replay.
+Files whose header is not a valid v2 header, legacy v1 volumes among them, are never removed
+or offered to `keep`.
+
+Names match exactly: `pattern`, a `.` (unless the pattern ends with one), then decimal digits
+without sign, space or leading zero. `data` touches `data.7`, not `database.7`, `data.bak.7`,
+`data.007` or `data.-1`. A directory entry of unknown type is asked about with `fstatat`.
+
+A writable open holds a shared `flock` on the volume for as long as the descriptor lives.
+Reclaim opens each candidate and takes the exclusive lock without blocking before it reads the
+header, holds it through the `unlink`, and skips the volume if it cannot: an upload in flight,
+or a committed record whose writer is still open, is never taken. A writable open that finds a
+reclaim holding the volume throws `StorageIOError` (`EWOULDBLOCK`), and one that finds the file
+unlinked between its open and its lock opens again. Where the filesystem has no advisory locks
+nothing is reclaimed.
 
 ## Limits and non-goals
 

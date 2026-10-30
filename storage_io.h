@@ -47,6 +47,8 @@
 #include <cerrno>           // for errno, EINTR
 #include <cstddef>          // for size_t
 #include <fcntl.h>          // for ::open, O_CLOEXEC, F_FULLFSYNC, F_PREALLOCATE
+#include <sys/file.h>       // for ::flock
+#include <sys/stat.h>       // for ::fstat
 #include <sys/types.h>      // for off_t, ssize_t
 #include <unistd.h>         // for ::read, ::write, ::pread, ::pwrite, ::lseek
 
@@ -67,7 +69,56 @@
 
 namespace storage {
 
+// Advisory volume locks and truncation on real descriptors. DefaultIO exposes them; the engine
+// uses them directly for an IO policy that does not define its own (see Storage::open_fd).
+namespace posix {
+
+// Shared, non-blocking lock for a writable open. 0: held, or the filesystem has no locks (the
+// open then runs unlocked). -1/EWOULDBLOCK: a reclaim holds the volume. -1/ESTALE: the file was
+// unlinked before the lock was taken.
+inline int lock_shared(int fd) noexcept {
+	int r;
+	do { r = ::flock(fd, LOCK_SH | LOCK_NB); } while (r == -1 && errno == EINTR);
+	if (r == -1) {
+		return errno == EWOULDBLOCK ? -1 : 0;
+	}
+	struct stat sb;
+	if (::fstat(fd, &sb) == 0 && sb.st_nlink == 0) {
+		errno = ESTALE;
+		return -1;
+	}
+	return 0;
+}
+
+// Exclusive, non-blocking lock, held until the descriptor closes. -1: someone has the volume,
+// the filesystem cannot lock, or the file is already unlinked.
+inline int lock_exclusive(int fd) noexcept {
+	int r;
+	do { r = ::flock(fd, LOCK_EX | LOCK_NB); } while (r == -1 && errno == EINTR);
+	if (r == -1) {
+		return -1;
+	}
+	struct stat sb;
+	if (::fstat(fd, &sb) != 0 || sb.st_nlink == 0) {
+		errno = ESTALE;
+		return -1;
+	}
+	return 0;
+}
+
+inline int ftruncate(int fd, off_t len) noexcept {
+	int r;
+	do { r = ::ftruncate(fd, len); } while (r == -1 && errno == EINTR);
+	return r;
+}
+
+}  // namespace posix
+
 struct DefaultIO {
+	static int lock_shared(int fd) noexcept { return posix::lock_shared(fd); }
+	static int lock_exclusive(int fd) noexcept { return posix::lock_exclusive(fd); }
+	static int ftruncate(int fd, off_t len) noexcept { return posix::ftruncate(fd, len); }
+
 	static int open(const char* path, int oflag = O_RDONLY, int mode = 0644) noexcept {
 		int fd;
 		do {
@@ -181,7 +232,8 @@ struct DefaultIO {
 #if defined(__APPLE__) && defined(F_PREALLOCATE)
 		// Ask for a contiguous chunk first, fall back to fragmented, then make
 		// the size stick with ftruncate (F_PREALLOCATE alone does not grow EOF).
-		fstore_t store = {F_ALLOCATECONTIG, F_PEOFPOSMODE, 0, offset + len, 0};
+		// F_PEOFPOSMODE counts from the allocated end of the file, so the length is len.
+		fstore_t store = {F_ALLOCATECONTIG, F_PEOFPOSMODE, 0, len, 0};
 		int err;
 		do { err = ::fcntl(fd, F_PREALLOCATE, &store); } while (err == -1 && errno == EINTR);
 		if (err == -1) {
@@ -189,12 +241,19 @@ struct DefaultIO {
 			do { err = ::fcntl(fd, F_PREALLOCATE, &store); } while (err == -1 && errno == EINTR);
 		}
 		if (err != -1) {
-			int t;
-			do { t = ::ftruncate(fd, offset + len); } while (t == -1 && errno == EINTR);
+			struct stat sb;
+			if (::fstat(fd, &sb) == 0 && sb.st_size < offset + len) {
+				int t;
+				do { t = ::ftruncate(fd, offset + len); } while (t == -1 && errno == EINTR);
+				if (t == -1) { return -1; }
+			}
 		}
 		return err;
 #else
-		return ::posix_fallocate(fd, offset, len) == 0 ? 0 : -1;
+		int r = ::posix_fallocate(fd, offset, len);
+		if (r == 0) { return 0; }
+		errno = r;  // posix_fallocate returns the error instead of setting it
+		return -1;
 #endif
 	}
 

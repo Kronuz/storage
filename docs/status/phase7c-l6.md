@@ -67,6 +67,22 @@ above used the same flags built by hand with `SDKROOT` set.
 CI (workflow_dispatch, run 41035377548, commit `storage:a1e49db`): all 8 jobs green (linux gcc,
 clang, arm64 gcc, asan-ubsan, tsan, freebsd, macos arm64 and x86_64).
 
+## Review fixes (docs/reviews/phase7c-l6-code.md)
+
+| Finding | Fix | Test (fails when reverted) |
+|---|---|---|
+| L6-B1 reclaim unlinks a live writer's volume | writable open takes `flock(LOCK_SH)`; reclaim needs `LOCK_EX` before reading and unlinking | `test_reclaim_vs_live_writer` (probes P2, P3, committed-unnamed, open during reclaim) |
+| L6-N1 directory never synced | `commit()` fsyncs the directory once after a create, between the data and header syncs | `test_directory_sync` (event order file, dir, file) |
+| L6-N3 loose name matching | exact `pattern[.]digits`; DT_UNKNOWN asks `fstatat` | `test_volume_names` |
+| L6-N4 preallocation | exact reservation at begin, throws on a full disk; stream commit skips growfile; abort truncates; macOS `fallocate` counted the offset | `test_preallocation`, sparse `extent` asserts |
+| L6-N2 async fsync | documented in the mechanism note | none |
+
+Also found while testing: `write()` computed `curr_offset * STORAGE_ALIGNMENT` in 32 bits, so a
+`write()` at a byte offset past 4 GiB wrote its blocks at the wrong place and clobbered earlier
+records (fixed; the sparse `far` test writes there). Xapiand's `XapiandStorageIO` needs no change:
+an IO policy without `lock_shared`, `lock_exclusive` or `ftruncate` gets the POSIX calls on its
+real descriptor. L6-N5 (cursor assert under NDEBUG, error text) is not done.
+
 ## Findings outside this step
 
 1. **Kronuz/compressors, `LZ4DecompressData::next()` (`compressor_lz4.cc`, near `read_bin`)**:
@@ -74,10 +90,9 @@ clang, arm64 gcc, asan-ubsan, tsan, freebsd, macos arm64 and x86_64).
    damaged LZ4 stream writes past `cmpBuf` (ASan heap-buffer-overflow, WRITE of 2304 bytes).
    Reachable from storage when a record's flags byte turns damaged into "LZ4 compressed" (a bit
    flip). Reproducer: `~/code/Kronuz/storage/.scratch/l6/compressors-lz4-heap-overflow.crash`
-   (fuzz input). The fuzz target skips the flags byte until it is fixed in that repository.
-2. `commit()` preallocates 30% of the file after every commit (`growfile`). For a streamed volume
-   that is never appended again it is wasted disk (about 1.3 GiB after a 4 GiB upload). Not
-   changed here: a "no preallocation" open flag is a design question for the owner.
+   (fuzz input). Fixed in compressors `fix/lz4-bounds` (pinned in `CMakeLists.txt`): the fuzz
+   target now flips the flags byte too, and the crash input is the regression seed `fuzz/corpus/s8`.
+2. (Closed by L6-N4: a streamed volume is sized exactly.)
 
 ## Next
 

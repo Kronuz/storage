@@ -92,6 +92,13 @@ struct CrashIO {
 		if (r > 0) { s.fd_pos[fd] += r; }
 		return r;
 	}
+	static int lock_shared(int) noexcept { return 0; }       // fake descriptors: nothing to lock
+	static int lock_exclusive(int) noexcept { return 0; }
+	static int ftruncate(int fd, off_t len) noexcept {
+		auto& s = crashio::state();
+		s.files[s.fd_path[fd]].resize(static_cast<size_t>(len), 0);
+		return 0;
+	}
 	static int fsync(int /*fd*/) noexcept { crashio::state().fsyncs.push_back(crashio::state().log.size()); return 0; }
 	static int full_fsync(int fd) noexcept { return fsync(fd); }
 	static int fallocate(int, int, off_t, off_t) noexcept { return 0; }   // no-op: only real writes land

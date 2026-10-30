@@ -104,7 +104,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 	auto& img = crashio::state().files[key];
 	if (flags & 1) {
 		size_t at = flip % img.size();
-		if (at == STORAGE_BLOCK_SIZE + 1) { ++at; }  // the codec flags: damage there reaches the codecs (docs/status/phase7c-l6.md)
 		img[at] ^= static_cast<char>(mask ? mask : 1);
 	}
 	if (flags & 2) {  // the built image, damaged or not, as a volume on disk

@@ -46,7 +46,7 @@ advance, no alignment pad, abort without tail restore, publish before commit, co
 `Storage::commit`, limit off by one in both directions, `write()` during a stream, overrun,
 short commit, compressed flag on a streamed header, 32-bit reader bound, no room check, three
 reclaim variants plus "any header is empty", close leaving the writer attached, `growfile`
-int overflow, codec error escaping. 22 of 22 killed (`.scratch/mutants.py` in the worktree).
+int overflow, codec error escaping. 21 of 21 killed (`.scratch/mutants.py` in the worktree).
 
 Fixes found on the way, each with a test that fails when reverted:
 
@@ -73,8 +73,7 @@ otherwise); with it, see the ASan line above.
    (fuzz input). The fuzz target skips the flags byte until it is fixed in that repository.
 2. `commit()` preallocates 30% of the file after every commit (`growfile`). For a streamed volume
    that is never appended again it is wasted disk (about 1.3 GiB after a 4 GiB upload). Not
-   changed here; the host can pass `STORAGE_NO_SYNC`-style handling no better, so a
-   "no preallocation" open flag is a design question for the owner.
+   changed here: a "no preallocation" open flag is a design question for the owner.
 
 ## Next
 

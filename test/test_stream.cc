@@ -234,6 +234,30 @@ static void test_compat() {
 }
 
 
+// A header damaged to say "compressed" over an uncompressed payload: the codec fails, and
+// the reader reports a Storage* exception (not the codec's own).
+static void test_damaged_flags() {
+	auto dir = make_dir("flags");
+	for (uint8_t flags : {uint8_t(0x01), uint8_t(0x05), uint8_t(0x09)}) {   // LZ4, Zstandard, Deflate
+		uint32_t off;
+		{
+			DStore w(dir, nullptr);
+			w.open("d", WR);
+			off = stream_in(w, 5000, 1000, false, 1);
+		}
+		{
+			std::fstream f(dir + "d", std::ios::in | std::ios::out | std::ios::binary);
+			f.seekp(off * 8ll + 1);
+			f.put(static_cast<char>(flags));
+		}
+		DStore r(dir, nullptr);
+		r.open("d", STORAGE_OPEN);
+		CHECK_THROWS(({ r.seek(off); r.read(); }), StorageCorruptVolume);
+		std::filesystem::remove(dir + "d");
+	}
+	std::filesystem::remove_all(dir);
+}
+
 static void test_limits_and_misuse() {
 	auto dir = make_dir("misuse");
 	DStore st(dir, nullptr);
@@ -499,7 +523,8 @@ struct SparseIO : ::storage::DefaultIO {
 		}
 		return static_cast<ssize_t>(n);
 	}
-	static int fallocate(int, int, off_t, off_t) noexcept { return 0; }   // never allocate
+	static inline off_t last_grow_end = 0;   // the end of the last preallocation asked for
+	static int fallocate(int, int, off_t off, off_t len) noexcept { last_grow_end = off + len; return 0; }   // never allocate
 	static int fsync(int) noexcept { return 0; }
 	static int full_fsync(int) noexcept { return 0; }
 };
@@ -560,6 +585,8 @@ static void test_big() {
 		w.open("max", WR);
 		CHECK_THROWS(SStore::StreamWriter(w, SStore::stream_max_size + 1), StorageTooLarge);
 		uint32_t off = stream_big(w, SStore::stream_max_size);
+		// Commit asks to preallocate past the 4 GiB file (the size arithmetic is 64-bit).
+		CHECK(SparseIO::last_grow_end > static_cast<off_t>(SStore::stream_max_size) + 4096);
 		w.close();
 		SStore r(dir, nullptr);
 		r.open("max", STORAGE_OPEN);
@@ -630,6 +657,7 @@ int main(int argc, char** argv) {
 		test_roundtrips();
 		test_compat();
 		test_limits_and_misuse();
+		test_damaged_flags();
 		test_abandon();
 		test_crash_sweep();
 		test_reclaim();

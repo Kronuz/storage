@@ -510,7 +510,7 @@ class Storage {
 			if (free_blocks <= STORAGE_BLOCKS_MIN_FREE) {
 				int total_blocks = static_cast<int>(file_size / STORAGE_BLOCK_SIZE);
 				total_blocks = total_blocks < STORAGE_BLOCKS_MIN_FREE ? STORAGE_BLOCKS_MIN_FREE : total_blocks * STORAGE_BLOCKS_GROWTH_FACTOR;
-				off_t new_size = total_blocks * STORAGE_BLOCK_SIZE;
+				off_t new_size = static_cast<off_t>(total_blocks) * STORAGE_BLOCK_SIZE;
 				if (new_size > STORAGE_LAST_BLOCK_OFFSET) {
 					new_size = STORAGE_LAST_BLOCK_OFFSET;
 				}
@@ -1053,7 +1053,14 @@ public:
 					THROW(StorageCorruptVolume, "Incomplete bin data");
 				}
 				bin_offset += bin_header.size;
-				_record = storage_decompress(codec, std::string_view(payload.data(), payload.size()));
+				try {
+					_record = storage_decompress(codec, std::string_view(payload.data(), payload.size()));
+				} catch (const StorageException&) {
+					throw;
+				} catch (const Error&) {
+					// A damaged payload fails in the codec; the contract is a Storage* exception.
+					THROW(StorageCorruptVolume, "Cannot decompress bin");
+				}
 				_record_offset = 0;
 			} else {
 				compressors::XXH32_reset(&xxh_state, STORAGE_CHECKSUM_SEED);

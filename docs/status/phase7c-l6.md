@@ -59,9 +59,13 @@ Fixes found on the way, each with a test that fails when reverted:
 
 Sanitizers: ASan+UBSan build of the whole suite (all 9 tests incl. the fuzz replay) clean.
 libFuzzer (`fuzz/fuzz_stream.cc`, ASan+UBSan): 200k runs clean over a built-then-damaged image,
-reclaim and open. `cpp-libraries/tools/preflight.sh . mac`: mac-hardened ok; mac-asan-ubsan
-needs `SDKROOT=$(xcrun --show-sdk-path)` here (Homebrew LLVM 23 cannot find the SDK headers
-otherwise); with it, see the ASan line above.
+reclaim and open. `cpp-libraries/tools/preflight.sh . mac`: mac-hardened ok; its mac-asan-ubsan
+step fails on this host before compiling any storage code (Homebrew LLVM 23 cannot find the SDK
+headers; with `SDKROOT` set the hardened step cannot find lz4.h instead), so the ASan+UBSan run
+above used the same flags built by hand with `SDKROOT` set.
+
+CI (workflow_dispatch, run 41035377548, commit `storage:a1e49db`): all 8 jobs green (linux gcc,
+clang, arm64 gcc, asan-ubsan, tsan, freebsd, macos arm64 and x86_64).
 
 ## Findings outside this step
 

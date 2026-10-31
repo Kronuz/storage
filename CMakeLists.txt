@@ -24,10 +24,10 @@ endif()
 #   errno-names -> error::name / error::description           (error.hh)
 #   strict-stox -> strict_stoull                              (strict_stox.hh)
 #   stringified -> stringified                                (stringified.hh)
-FetchContent_Declare(compressors GIT_REPOSITORY https://github.com/Kronuz/compressors.git GIT_TAG 0498bf53acc21246a69d1c05f50027b4f2be26fc)
+FetchContent_Declare(compressors GIT_REPOSITORY https://github.com/Kronuz/compressors.git GIT_TAG 8f57675a9630590419ccd1f748720eafb542165f)
 FetchContent_Declare(errno_names GIT_REPOSITORY https://github.com/Kronuz/errno-names.git GIT_TAG 73b74938b3a455423cdf4c0039372dc1fe3b71c7)
-FetchContent_Declare(strict_stox GIT_REPOSITORY https://github.com/Kronuz/strict-stox.git GIT_TAG 21b7941c71064b5a4e52ffb50a2701ee4aae4c6c)
-FetchContent_Declare(stringified GIT_REPOSITORY https://github.com/Kronuz/stringified.git GIT_TAG 5b16ec9cff9b5aebf783dfecd713e1c2a3084c42)
+FetchContent_Declare(strict_stox GIT_REPOSITORY https://github.com/Kronuz/strict-stox.git GIT_TAG 5d979797b9799afcdacc0c004c229e2d61af1341)
+FetchContent_Declare(stringified GIT_REPOSITORY https://github.com/Kronuz/stringified.git GIT_TAG 2c78a1dcd97d056349700af46e502c85074c6561)
 FetchContent_MakeAvailable(compressors errno_names strict_stox stringified)
 
 # --- Library target (header-only) ---

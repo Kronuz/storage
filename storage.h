@@ -1633,11 +1633,31 @@ public:
 	std::string read(uint32_t limit=-1, void* args=nullptr) {
 		L_CALL("Storage::read() [2]");
 
-		std::string ret;
-
+		// A small record is one chunk from the stack. A larger one is read straight into the
+		// result, which doubles as it fills: a compressed record is served from its
+		// decompressed copy in one memcpy per doubling, instead of a string per 2 KB chunk.
 		char buf[LZ4_BLOCK_SIZE];
-		while (auto read_size = read(buf, sizeof(buf), limit, args)) {
-			ret += std::string(buf, read_size);
+		auto read_size = read(buf, sizeof(buf), limit, args);
+		std::string ret(buf, read_size);
+		if (read_size) {
+			// The next read is the one that returns 0 once the record is done (and checks its footer).
+			read_size = read(buf, sizeof(buf), limit, args);
+			if (read_size) {
+				size_t len = ret.size();
+				ret.append(buf, read_size);
+				len += read_size;
+				for (;;) {
+					if (ret.size() - len < LZ4_BLOCK_SIZE) {
+						ret.resize(ret.size() * 2);
+					}
+					read_size = read(ret.data() + len, ret.size() - len, limit, args);
+					if (!read_size) {
+						break;
+					}
+					len += read_size;
+				}
+				ret.resize(len);
+			}
 		}
 
 		return ret;

@@ -289,8 +289,8 @@ public:
 // thread pool keyed on the fd) installs one of these via the Storage constructor;
 // then, with STORAGE_ASYNC_SYNC set, commit() hands (fd, full_fsync) to the hook
 // instead of blocking on the syscall. With no hook installed, STORAGE_ASYNC_SYNC
-// degrades gracefully to a synchronous fsync. This is the seam that replaces the
-// in-tree debouncer + thread pool + opts the standalone engine no longer carries.
+// degrades gracefully to a synchronous fsync. A host plugs its own debouncer and
+// thread pool in here.
 using StorageFsyncFn = std::function<void(int fd, bool full_fsync)>;
 
 
@@ -313,7 +313,7 @@ using StorageFsyncFn = std::function<void(int fd, bool full_fsync)>;
 struct StorageMetaHead {
 	uint32_t magic;      // STORAGE_MAGIC (identifies a v2 header)
 	uint16_t version;    // meta format version (currently 2)
-	uint16_t reserved;   // reserved for flags; zero for now
+	uint16_t reserved;   // reserved for flags; always zero
 	uint64_t txnid;      // monotonic commit counter
 	uint64_t offset;     // committed high-water mark, in STORAGE_ALIGNMENT units
 	uint32_t checksum;   // XXH32 over the whole block with these 4 bytes treated as zero
@@ -1012,10 +1012,9 @@ public:
 
 		// Read the whole file, then store it through write(): one code path, so
 		// codec dispatch and checksums are shared with write() and there is no
-		// second copy of the block-writing machinery. The in-tree engine streamed
-		// here to avoid buffering the file, but the storage use is bounded blobs,
-		// so the buffer is acceptable; a consumer with huge files should chunk
-		// them into multiple write() calls.
+		// second copy of the block-writing machinery. Records are bounded blobs, so
+		// the buffer is acceptable; a consumer with huge files should chunk them
+		// into multiple write() calls.
 		stringified filename_string(filename);
 		int fd_read = IO::open(filename_string.c_str(), O_RDONLY, 0644);
 		if unlikely(fd_read == -1) {

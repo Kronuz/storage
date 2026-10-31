@@ -91,6 +91,7 @@ operation through your IO policy.
 - [examples/](examples): `toy_wal.cc`, `toy_data_store.cc`, and `bench.cc`
   (throughput and compression ratio per codec).
 - [AGENTS.md](AGENTS.md): repository map and invariants.
+- [CHANGELOG.md](CHANGELOG.md): behavior changes and their measurements.
 
 ## 🛠️ Building and testing
 

@@ -12,15 +12,15 @@ w.append(chunk) ...              // each chunk to the volume, blocking
 offset = w.commit();             // footer, pad, fsync data, publish the header
 ```
 
-## Format: unchanged
+## Format
 
 The record is the ordinary framing: `StorageBinHeader`, payload, `StorageBinFooter`, padded to
 `STORAGE_ALIGNMENT`, at the volume's append cursor. Differences from `write()` are in what is
 chosen, not in the layout:
 
 - Flags are 0: the payload is stored uncompressed. The header's `size` is the stored size, and a
-  compressed size is not known when the header is written. `read()` already serves flags 0, so
-  every existing reader reads a streamed record unchanged.
+  compressed size is not known when the header is written. `read()` serves flags 0, so every
+  reader reads a streamed record.
 - `size` is a `uint32_t`, so a payload is at most `stream_max_size` (4 GiB - 1) bytes, framing the
   host adds included. `begin` throws `StorageTooLarge` above it; the host maps that to its own
   413. A record must also end below the volume's last block (`StorageEOF` at begin, before any
@@ -103,11 +103,9 @@ nothing is reclaimed.
 
 ## Limits and non-goals
 
-- Reads are unchanged: a streamed record reads back in chunks through `read(buf, n)`, as any
-  uncompressed record.
+- A streamed record reads back in chunks through `read(buf, n)`, as any uncompressed record.
 - No compression, no resume, no shared-volume interleaving (one stream at a time per storage).
-- `read()` bounds a record by the 64-bit byte offset (it used a 32-bit product, so a record
-  starting past 4 GiB of byte offset read as EOF).
+- `read()` bounds a record by its 64-bit byte offset, so a record that starts past 4 GiB of byte offset reads normally.
 - Whether a blob engine replaces the host's `stored` store is a separate design; this adds one
   write path and no format.
 

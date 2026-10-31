@@ -64,9 +64,9 @@ The bin header's `STORAGE_FLAG_COMPRESSED` bit marks whether a record's payload 
 compressed, and bits 2-4 hold the **codec id** (LZ4 = 0, ZSTD = 1, DEFLATE = 2).
 The open flags pick the write codec (`STORAGE_COMPRESS_ZSTD` — the default —
 `STORAGE_COMPRESS_LZ4`, or `STORAGE_COMPRESS_DEFLATE`); `read()` dispatches on the
-stored id. Because LZ4 is codec 0, a volume written before codec-in-header (whose
-records have the compressed bit set and the codec bits zero) reads back as LZ4
-with no migration, and a single volume can mix codecs and raw records (records
+stored id. Because LZ4 is codec 0, a record with the compressed bit set and the
+codec bits zero (as Xapiand's LZ4-only engine writes) reads back as LZ4 with no
+migration, and a single volume can mix codecs and raw records (records
 below `STORAGE_MIN_COMPRESS_SIZE` are stored raw even with a compress flag set).
 
 Compression goes through the compressors library's one-shot helpers
@@ -75,8 +75,8 @@ framing as its streaming classes. So an LZ4 record written here is byte-identica
 to one the in-tree streaming engine wrote. `write()` compresses the whole record
 up front into one contiguous payload; `read()` reads the payload and decompresses
 it once into a buffer, serving the result in chunks. Records are bounded, so the
-buffering is cheap; it also removes the codec-specific streaming-from-fd classes
-the engine used to need (Zstandard has no such class in the compressors library).
+buffering is cheap, and no codec-specific streaming-from-fd class is needed
+(Zstandard has no such class in the compressors library).
 
 The checksum is XXH32 over the *uncompressed* bytes (the same for a raw or
 compressed record), via the compressors library's canonical XXH32, which matches
@@ -88,8 +88,7 @@ An append-only store is easy to write and easy to read; the hard part is what
 happens when a write is interrupted or a volume is damaged. The contract here:
 damage must be **detected** (a `Storage*` exception, never a crash, an unbounded
 allocation, or silently returned garbage), and every record committed **before**
-the damage must remain readable. What backs that contract, and where the current
-gaps are:
+the damage must remain readable. What backs that contract, and its known limits:
 
 **What the reader guarantees.** `read()` throws, never misbehaves, on a torn or
 corrupt record:
@@ -162,36 +161,38 @@ consumer using them as-is has no *record*-level corruption detection. Xapiand's
 `STORAGE_BIN_HEADER_MAGIC` + `STORAGE_BIN_FOOTER_MAGIC` + XXH32, so real records
 are protected; the `toy_data_store` example shows the same on v2.
 
-**Still open (follow-ups).**
-- The Xapiand **WAL** is now v2 as well: its header carries a `StorageMetaHead`,
+**Known limits.**
+- The Xapiand **WAL** is v2 as well: its header carries a `StorageMetaHead`,
   data starts at block 1, and because its slot array spans the whole block a torn
   header is caught by the checksum and the WAL quarantines the volume (it is a
   rescue log; existing v1 WAL volumes quarantine on upgrade the same way, since
   they have no v2 header). Only the docstore keeps the v1-read path.
 - **Tail-block write amplification:** `write()` re-`pwrite`s the current partial
   tail block on every call, so a 4 KiB block holding many small records is written
-  once per record (page-cache writes, not fsync, but one syscall each). Since the
-  tail block is not durable until `commit()`, only completed blocks need eager
-  writes; flushing the final partial block in `commit()` would cut those syscalls
+  once per record (page-cache writes, not fsync, but one syscall each). The tail
+  block is not durable until `commit()`, so only completed blocks need eager
+  writes: flushing the final partial block in `commit()` cuts those syscalls
   without changing durability.
-- **Integrity by default:** making the reference structs carry magic + checksum
-  (so a new consumer is safe without opting in) is a reference-format change.
+- **No integrity by default:** the reference structs carry no magic or checksum,
+  so a new consumer opts in to record-level checks with its own footer. Adding
+  them to the reference structs is a reference-format change.
 
-## Extraction notes (what changed from the in-tree engine)
+## Differences from the in-tree engine
 
 The engine logic (block layout, alignment, buffering, compression framing,
-checksums) is verbatim. Only the couplings were severed:
+checksums) matches Xapiand's in-tree engine. The couplings differ:
 
-- **IO** — the 30 `io::*` calls became `IO::*` on an injected policy
-  (`DefaultIO` by default). This is the one structural change to the engine's
-  call sites.
-- **Async fsync** — the in-tree static debouncer + thread pool + `opts.*`
-  timings became a single injectable `StorageFsyncFn`; with no hook,
+- **IO** — every file operation is an `IO::*` call on an injected policy
+  (`DefaultIO` by default). This is the one structural difference at the
+  engine's call sites.
+- **Async fsync** — a single injectable `StorageFsyncFn` stands in for the
+  in-tree static debouncer + thread pool + `opts.*` timings; with no hook,
   `STORAGE_ASYNC_SYNC` falls back to a synchronous fsync.
 - **Exceptions** — the `Storage*` hierarchy derives from the `Error` the
   compressors library already brings in via `compressor_lz4.h` (one `Error`, no
-  ODR clash); a host redirects it through `COMPRESSORS_EXCEPTION_HEADER`. The
-  in-tree `throw Xapian::DatabaseNotFoundError` became `THROW(StorageNotFound)`.
+  ODR clash); a host redirects it through `COMPRESSORS_EXCEPTION_HEADER`. A
+  missing volume throws `StorageNotFound` (Xapiand throws
+  `Xapian::DatabaseNotFoundError`).
 - **Logging** — the `L_*` family is no-op by default, redirected via
   `STORAGE_TRACE_HEADER`.
 - **Filesystem** — `normalize_path` is vendored (`storage_fs.h`); volume

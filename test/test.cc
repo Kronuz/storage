@@ -54,7 +54,7 @@ static void flip_byte(const std::string& path, long pos) {
 }
 
 
-// The default reference StorageHeader is now v2 (a checksummed StorageMetaHead);
+// The default reference StorageHeader is v2 (a checksummed StorageMetaHead);
 // StorageBinHeader/StorageBinFooter carry no per-record magic or checksum, so this
 // suite also defines a checksummed footer to exercise the record validate() path.
 #pragma pack(push, 1)
@@ -318,8 +318,8 @@ int main() {
 	}
 
 	// ---- concurrency: independent instances on independent volumes ----
-	// The engine carries no shared/static state (the in-tree static fsyncher is
-	// gone, replaced by the per-instance async-fsync hook), so N threads each
+	// The engine carries no shared/static state (async fsync goes through a
+	// per-instance hook), so N threads each
 	// driving their own Storage on their own volume must run race-free. This is
 	// the scenario the TSAN build exercises.
 	{

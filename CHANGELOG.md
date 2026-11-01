@@ -7,6 +7,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The compressors pin moves to `9bd24af`. Its XXH32 computes the same digest on every
+  host byte order (storage still writes its header, footer and record structs in host
+  order, so a volume is not yet portable across byte orders). Its XXH32 is 2-6x faster
+  on x86, which checksums every record, and the zstd and deflate one-shots no longer
+  create a context or copy the result per call: on a 256 B record `decompress_zstd`
+  takes 32 ns instead of 1190 ns (Linux x86_64, `compressors_bench_oneshot`). The bytes
+  written are identical.
 - `Storage::read(limit, args)` reads a small record from one stack chunk and a
   larger one straight into the result, which doubles as it fills. It used to
   build the result from 2 KB chunks, one `std::string` and two copies each. The

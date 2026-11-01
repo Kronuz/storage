@@ -24,11 +24,12 @@
 #pragma once
 
 // Minimal filesystem helper for the storage library: a pure-string path
-// normalizer, vendored verbatim from Xapiand's fs.cc (the only thing storage.h
-// needed from fs.hh once volume discovery is done inline with readdir). It
-// resolves "." / ".." textually (no stat, no symlink resolution) and applies the
-// trailing-slash policy the engine's base_path wants. Header-only, zero
-// dependency.
+// normalizer, from Xapiand's fs.cc and the same algorithm as the fs library's
+// (the only thing storage.h needed from fs.hh once volume discovery is done
+// inline with readdir). It resolves "." / ".." textually (no stat, no symlink
+// resolution) and applies the trailing-slash policy the engine's base_path
+// wants. An empty path stays empty: it names no directory, and the root is not
+// its normal form. Header-only, zero dependency.
 
 #include <string>           // for std::string
 #include <string_view>     // for std::string_view
@@ -39,10 +40,17 @@ inline std::size_t normalize_path(const char* src, const char* end, char* dst, b
 	int levels = 0;
 	char* ret = dst;
 	char ch = '\0';
-	const char* last = keep_slash ? end - 1 : end;
-	while (src <= last) {
-		ch = src == end ? '/' : *src;
-		++src;
+	// Visit every byte of [src, end), then the closing '/' of the last component unless keep_slash.
+	// An empty path has no last component, so it gets no closing '/' (that would name the root).
+	// There is no end - 1, so a default-constructed view (a null src) is the empty path.
+	bool closing = !keep_slash && src < end;
+	while (src < end || closing) {
+		if (src < end) {
+			ch = *src++;
+		} else {
+			ch = '/';
+			closing = false;
+		}
 		if (ch == '.' && (levels != 0 || dst == ret || *(dst - 1) == '/' )) {
 			*dst++ = ch;
 			++levels;

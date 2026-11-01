@@ -5,8 +5,9 @@
 #
 # Header-only engine: a Storage<Header, BinHeader, Footer, IO> template over an
 # injected IO policy (DefaultIO by default) and an optional async-fsync hook. The
-# on-disk format is byte-identical to the in-tree Xapiand engine; LZ4 is the only
-# codec for now (a codec-in-header refactor for zstd/deflate is a follow-up).
+# on-disk format is byte-identical to the in-tree Xapiand engine. A record is
+# stored raw or compressed with one of three codecs (LZ4, Zstandard, Deflate; the
+# codec id is in the bin-header flags), all from the compressors library.
 
 cmake_minimum_required(VERSION 3.16)
 project(storage LANGUAGES CXX)
@@ -20,12 +21,13 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # --- Dependencies (the Kronuz family, tracked at tip) ---
-#   compressors -> compressor_lz4.h (LZ4*), xxh32_stream.h (XXH32), Error/THROW
+#   compressors -> compressor_lz4.h, compressor_zstd.h, compressor_deflate.h, xxh32_stream.h
+#                  (XXH32), Error/THROW
 #   errno-names -> error::name / error::description           (error.hh)
 #   strict-stox -> strict_stoull                              (strict_stox.hh)
 #   stringified -> stringified                                (stringified.hh)
 FetchContent_Declare(compressors GIT_REPOSITORY https://github.com/Kronuz/compressors.git GIT_TAG fe0e7127512ac14c57e9083733dcd48d2b701de8)
-FetchContent_Declare(errno_names GIT_REPOSITORY https://github.com/Kronuz/errno-names.git GIT_TAG 73b74938b3a455423cdf4c0039372dc1fe3b71c7)
+FetchContent_Declare(errno_names GIT_REPOSITORY https://github.com/Kronuz/errno-names.git GIT_TAG 0ec0801ff7b4d32412d33b2c7e041c6b55f38d14)
 FetchContent_Declare(strict_stox GIT_REPOSITORY https://github.com/Kronuz/strict-stox.git GIT_TAG 5d979797b9799afcdacc0c004c229e2d61af1341)
 FetchContent_Declare(stringified GIT_REPOSITORY https://github.com/Kronuz/stringified.git GIT_TAG 0053465ae99fb0f344f3c7a16dc88b4ec473ceb0)
 FetchContent_MakeAvailable(compressors errno_names strict_stox stringified)
@@ -69,6 +71,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(storage_test_nolegacy PRIVATE storage)
 	target_compile_definitions(storage_test_nolegacy PRIVATE STORAGE_LEGACY_SUPPORT=0)
 	add_test(NAME storage_nolegacy COMMAND storage_test_nolegacy)
+
+	# The base path normalizer: an empty path stays empty (a Storage with no base path opens its
+	# volumes in the working directory, not at the root), everything else equals the frozen loop.
+	add_executable(storage_test_path test/test_path.cc)
+	target_link_libraries(storage_test_path PRIVATE storage)
+	add_test(NAME storage_path COMMAND storage_test_path)
 
 	# Crash-consistency + corruption matrix for the v2 format, driven through an
 	# in-memory write-logging IO policy (simulated power loss).

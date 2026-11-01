@@ -14,7 +14,7 @@ paths before changing the engine.
 ```
 storage.h          The engine: Storage<Header, BinHeader, Footer, IO> template.
 storage_io.h       DefaultIO: the portable, EINTR-safe POSIX IO policy.
-storage_fs.h       Vendored normalize_path (pure-string path normalizer).
+storage_fs.h       Vendored normalize_path (pure-string path normalizer; an empty path stays empty).
 storage_trace.h    No-op L_* logging hooks (redirect via STORAGE_TRACE_HEADER).
 likely.h           Vendored likely()/unlikely() branch hints.
 test/test.cc       ctest: round-trip, multi-volume, checksum, write_file,

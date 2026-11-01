@@ -196,4 +196,6 @@ checksums) matches Xapiand's in-tree engine. The couplings differ:
 - **Logging** — the `L_*` family is no-op by default, redirected via
   `STORAGE_TRACE_HEADER`.
 - **Filesystem** — `normalize_path` is vendored (`storage_fs.h`); volume
-  discovery does its own `readdir` instead of pulling in `fs.hh`.
+  discovery does its own `readdir` instead of pulling in `fs.hh`. The base path is
+  normalized with a trailing `/`; an empty base path stays empty, so volumes open
+  relative to the working directory.

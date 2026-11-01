@@ -189,8 +189,8 @@ struct DefaultIO {
 	}
 
 	static ssize_t pread(int fd, void* buf, size_t nbyte, off_t offset) noexcept {
-		// Mirrors Xapiand io::pread: a single (EINTR-safe) pread; the caller
-		// loops if it needs more, and tolerates a short count.
+		// A single (EINTR-safe) pread; the caller loops if it needs more, and
+		// tolerates a short count.
 		auto* p = static_cast<char*>(buf);
 		while (nbyte != 0) {
 			ssize_t c = ::pread(fd, p, nbyte, offset);

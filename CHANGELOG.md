@@ -5,6 +5,30 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## 2026-11-01
 
+### Fixed
+
+- A `Storage` with an empty base path kept `"/"`: the vendored `normalize_path` appended its
+  closing `/` to nothing and returned the root, so `Storage("", ...)` opened `"/vol.0"` at the
+  root of the filesystem. An empty path now stays empty in every flag combination (oracle:
+  `std::filesystem::path::lexically_normal`, which maps `""` to `""`), so the volumes open
+  relative to the working directory. A default-constructed view gives the same result. The
+  loop no longer forms `end - 1`, which wrapped around for an empty view with `keep_slash`
+  (the engine passes `slashed` only). The same fix is in `fs`. Every non-empty input gives
+  the bytes it gave before: `storage_path` compares the old loop with the new over every
+  string of `a`, `.` and `/` up to length 7 and 20,000 random ones, in all four flag
+  combinations, and checks that a relative path never becomes absolute. With the old
+  `storage_fs.h` it fails on every empty-path check.
+
+### Changed
+
+- The comment in `CMakeLists.txt` said that LZ4 is the only codec, and that zstd and deflate are
+  a follow-up. A record is stored raw or with LZ4, Zstandard (the default) or Deflate; the codec
+  id is in the bin-header flags (`storage.h`), and the comment and the dependency note
+  (`compressor_lz4.h`, `compressor_zstd.h`, `compressor_deflate.h`) say so.
+- The errno-names pin moves to `0ec0801`, whose `error::description` is the libc's text on glibc
+  (it was `"Unknown error: N"` for every errno there); the engine's I/O error logs name the
+  failure.
+
 ### Added
 
 - `test/format_golden.cc` and `test/fixtures/`: one volume per codec written by the engine

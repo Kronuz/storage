@@ -4,7 +4,7 @@
 
 **Verdict: APPROVE WITH CONDITIONS.** The write path, commit order, cursor and alignment hold. One blocker: `reclaim_volumes` deletes a volume a live writer owns, and the writer's `commit()` still returns success (L6-B1). Preallocation: nothing blocks the lead's ruling; see L6-N4.
 
-Probes live in the worktree `~/code/Kronuz/storage-wt/l6-streamed-write/.scratch/review-l6/` (kept): `probe.cc` + `build.sh` (ASan+UBSan, P1-P8), `falloc.cc`, `falloc2.cc`, and the sanitizer build under `build/`. `test_stream` (default mode) passes under ASan+UBSan in that build.
+Probes lived in a worktree of branch `phase7c/l6-streamed-write`, in a scratch directory that is not kept: `probe.cc` + `build.sh` (ASan+UBSan, P1-P8), `falloc.cc`, `falloc2.cc`, and the sanitizer build. `test_stream` (default mode) passes under ASan+UBSan in that build.
 
 ## What holds (probed, not redone)
 

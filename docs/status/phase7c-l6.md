@@ -1,4 +1,4 @@
-> Status: CURRENT (2026-10-30) workstream phase7c-l6 (developer); branch `phase7c/l6-streamed-write`, worktree `~/code/Kronuz/storage-wt/l6-streamed-write`.
+> Status: CURRENT (2026-10-30) workstream phase7c-l6 (developer); branch `phase7c/l6-streamed-write`.
 
 # Phase 7c L6: the streamed record write
 
@@ -46,7 +46,7 @@ advance, no alignment pad, abort without tail restore, publish before commit, co
 `Storage::commit`, limit off by one in both directions, `write()` during a stream, overrun,
 short commit, compressed flag on a streamed header, 32-bit reader bound, no room check, three
 reclaim variants plus "any header is empty", close leaving the writer attached, `growfile`
-int overflow, codec error escaping. 21 of 21 killed (`.scratch/mutants.py` in the worktree).
+int overflow, codec error escaping. 21 of 21 killed (by a mutation script that is not kept).
 
 Fixes found on the way, each with a test that fails when reverted:
 
@@ -89,7 +89,7 @@ real descriptor. L6-N5 (cursor assert under NDEBUG, error text) is not done.
    `cmpBytes` (u16) is checked against the input but not against `cmpBuf`'s capacity, so a
    damaged LZ4 stream writes past `cmpBuf` (ASan heap-buffer-overflow, WRITE of 2304 bytes).
    Reachable from storage when a record's flags byte turns damaged into "LZ4 compressed" (a bit
-   flip). Reproducer: `~/code/Kronuz/storage/.scratch/l6/compressors-lz4-heap-overflow.crash`
+   flip). Reproducer: `compressors-lz4-heap-overflow.crash`
    (fuzz input). Fixed in compressors `fix/lz4-bounds` (pinned in `CMakeLists.txt`): the fuzz
    target now flips the flags byte too, and the crash input is the regression seed `fuzz/corpus/s8`.
 2. (Closed by L6-N4: a streamed volume is sized exactly.)

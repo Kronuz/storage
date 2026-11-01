@@ -97,8 +97,8 @@ operation through your IO policy.
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
-ctest --test-dir build      # round trips, multi-volume, checksums, crashes, v2-only
-./build/storage_bench       # throughput and ratio per codec
+ctest --test-dir build      # round trips, multi-volume, checksums, crashes, v2-only, on-disk golden volumes
+./build/storage_bench       # throughput and ratio per codec, with raw codec + pwrite/pread rows
 ```
 
 ## 🤝 Contributing

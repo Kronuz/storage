@@ -5,6 +5,11 @@
  * without compression, plus the on-disk compression ratio on compressible data.
  * Single instance, single thread: this measures the engine's serial path, not
  * concurrency (the injected async-fsync hook is where a host adds that).
+ *
+ * Each compressed scenario is followed by a "raw" row: the same records through the
+ * codec library and pwrite/pread alone, one file, no headers, footers or checksums,
+ * records addressed from an in-memory table. The raw row is the floor the engine's
+ * framing is measured against; it uses one LZ4 block or one zstd frame per record.
  */
 
 #include "storage.h"
@@ -13,9 +18,18 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
+#include <fcntl.h>
 #include <unistd.h>      // for mkdtemp
+
+#if __has_include(<lz4.h>) && __has_include(<zstd.h>)
+#  include <lz4.h>
+#  include <zstd.h>
+#  define STORAGE_BENCH_RAW 1
+#endif
 
 using RefStorage = Storage<StorageHeader, StorageBinHeader, StorageBinFooter>;
 using clk = std::chrono::steady_clock;
@@ -99,6 +113,51 @@ static Result run(const std::string& base, const char* vol, size_t blob_size, si
 	};
 }
 
+#ifdef STORAGE_BENCH_RAW
+// The floor for one codec (0 none, LZ4, zstd): compress each record, pwrite it at the end of one
+// file, fsync once; then pread each record and decompress it. The page cache is warm, as for run().
+static Result run_raw(const std::string& base, const char* file, size_t blob_size, size_t count, int codec_flag) {
+	std::string blob = make_blob(blob_size);
+	std::string path = base + "raw_" + file;
+	int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+	if (fd == -1) { std::perror("open"); std::exit(2); }
+
+	const bool lz4 = codec_flag == STORAGE_COMPRESS_LZ4, zstd = codec_flag == STORAGE_COMPRESS_ZSTD;
+	std::string packed(zstd ? ZSTD_compressBound(blob_size) : lz4 ? static_cast<size_t>(LZ4_compressBound(static_cast<int>(blob_size))) : blob_size, '\0');
+	std::vector<std::pair<off_t, size_t>> records;
+	records.reserve(count);
+	double total_mb = (static_cast<double>(blob_size) * count) / (1024.0 * 1024.0);
+
+	auto t0 = clk::now();
+	off_t at = 0;
+	for (size_t i = 0; i < count; ++i) {
+		size_t n;
+		if (zstd) { n = ZSTD_compress(packed.data(), packed.size(), blob.data(), blob_size, ZSTD_COMPRESS_LEVEL); }
+		else if (lz4) { n = static_cast<size_t>(LZ4_compress_default(blob.data(), packed.data(), static_cast<int>(blob_size), static_cast<int>(packed.size()))); }
+		else { n = blob_size; std::memcpy(packed.data(), blob.data(), n); }
+		if (::pwrite(fd, packed.data(), n, at) != static_cast<ssize_t>(n)) { std::perror("pwrite"); std::exit(2); }
+		records.emplace_back(at, n);
+		at += static_cast<off_t>(n);
+	}
+	::fsync(fd);
+	auto t1 = clk::now();
+
+	std::string back(blob_size, '\0');
+	auto t2 = clk::now();
+	for (const auto& rec : records) {
+		if (::pread(fd, packed.data(), rec.second, rec.first) != static_cast<ssize_t>(rec.second)) { std::perror("pread"); std::exit(2); }
+		if (zstd) { ZSTD_decompress(back.data(), blob_size, packed.data(), rec.second); }
+		else if (lz4) { LZ4_decompress_safe(packed.data(), back.data(), static_cast<int>(rec.second), static_cast<int>(blob_size)); }
+		else { std::memcpy(back.data(), packed.data(), blob_size); }
+	}
+	auto t3 = clk::now();
+	if (back != blob) { std::fprintf(stderr, "raw row %s: round trip differs\n", file); std::exit(1); }
+	::close(fd);
+
+	return Result{total_mb / secs(t0, t1), total_mb / secs(t2, t3), static_cast<double>(blob_size) * count / static_cast<double>(at)};
+}
+#endif
+
 int main() {
 	std::string base = make_tmpdir();
 	std::printf("%-28s %12s %12s %10s\n", "scenario", "write MB/s", "read MB/s", "ratio");
@@ -119,6 +178,13 @@ int main() {
 	for (const auto& c : cases) {
 		Result r = run(base, c.vol, c.size, c.count, c.codec);
 		std::printf("%-28s %12.1f %12.1f %10.2f\n", c.name, r.write_mbs, r.read_mbs, r.ratio);
+#ifdef STORAGE_BENCH_RAW
+		if (c.codec != STORAGE_COMPRESS_DEFLATE) {
+			std::string raw_name = std::string("  raw ") + (c.codec == 0 ? "pwrite/pread" : c.codec == STORAGE_COMPRESS_LZ4 ? "lz4" : "zstd");
+			Result f = run_raw(base, c.vol, c.size, c.count, c.codec);
+			std::printf("%-28s %12.1f %12.1f %10.2f\n", raw_name.c_str(), f.write_mbs, f.read_mbs, f.ratio);
+		}
+#endif
 	}
 	return 0;
 }

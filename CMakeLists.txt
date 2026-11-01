@@ -55,6 +55,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(storage_test PRIVATE storage)
 	add_test(NAME storage COMMAND storage_test)
 
+	# On-disk identity: volumes written by the reference engine (one per codec, test/fixtures/)
+	# must read back record for record, and the uncompressed volume must be reproduced byte for byte.
+	add_executable(storage_format_golden test/format_golden.cc)
+	target_link_libraries(storage_format_golden PRIVATE storage)
+	target_compile_definitions(storage_format_golden PRIVATE STORAGE_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
+	add_test(NAME storage_format_golden COMMAND storage_format_golden)
+
 	# The same suite built v2-ONLY (STORAGE_LEGACY_SUPPORT=0): proves the v1 path
 	# compiles out cleanly and the v2 tests still pass without it. The legacy-read
 	# test is #if'd out in this build.

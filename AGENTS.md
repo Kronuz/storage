@@ -22,8 +22,9 @@ test/test.cc       ctest: round-trip, multi-volume, checksum, write_file,
 test/test_crash.cc ctest: torn and interrupted commits against the v2 header.
 test/crashio.h     CrashIO: an in-memory, write-logging IO policy for crash tests.
 test/test_stream.cc ctest: the streamed record write (StreamWriter), orphan reclaim, sparse 4 GiB runs.
+test/format_golden.cc ctest: volumes written by the reference engine (test/fixtures/, one per codec) read back record for record; the uncompressed volume is reproduced byte for byte. `--write DIR` regenerates the fixtures.
 fuzz/              libFuzzer target and replay for the streamed write (-DSTORAGE_FUZZ=ON).
-examples/bench.cc  Runnable throughput / compression-ratio benchmark.
+examples/bench.cc  Runnable throughput / compression-ratio benchmark, with raw codec + pwrite/pread rows as the floor.
 examples/toy_wal.cc, toy_data_store.cc
                    Minimal v2 consumers (a WAL and a docstore).
 docs/INTEGRATION.md IO policy, async-fsync hook, logging.

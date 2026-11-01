@@ -18,9 +18,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   host byte order (storage still writes its header, footer and record structs in host
   order, so a volume is not yet portable across byte orders). Its XXH32 is 2-6x faster
   on x86, which checksums every record, and the zstd and deflate one-shots no longer
-  create a context or copy the result per call: on a 256 B record `decompress_zstd`
-  takes 32 ns instead of 1190 ns (Linux x86_64, `compressors_bench_oneshot`). The bytes
+  create a context or copy the result per call: on a 256 B record `decompress_zstd` takes
+  32 ns instead of 1190 ns (Linux x86_64, `compressors_bench_oneshot`). The bytes
   written are identical.
+- `storage_bench` on an Intel i9-9980HK (macOS, Apple clang 17), MB/s, before `9bd24af`
+  against `40221d2`, two rounds: 256 B zstd write 34 to 39, read 44 to 47; 256 B deflate
+  read 41 to 46; 1 MB zstd read 460 to 570; 1 MB deflate read 350 to 447; the lz4 and
+  uncompressed rows are within 3% (1 MB zstd write 249-260 to 269 and, once, 190).
 - `Storage::read(limit, args)` reads a small record from one stack chunk and a
   larger one straight into the result, which doubles as it fills. It used to
   build the result from 2 KB chunks, one `std::string` and two copies each. The

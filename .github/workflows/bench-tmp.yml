@@ -1,0 +1,35 @@
+name: bench-tmp
+on:
+  pull_request:
+jobs:
+  bench:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-24.04 }
+          - { name: macos-x86_64, os: macos-15-intel }
+          - { name: linux-arm64, os: ubuntu-24.04-arm }
+          - { name: macos-arm64, os: macos-15 }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Packages
+        run: |
+          if [ "$(uname)" = Darwin ]; then brew install zstd lz4; else sudo apt-get update -q && sudo apt-get install -y -q libzstd-dev liblz4-dev zlib1g-dev; fi
+      - name: Build old and new compressors pins
+        run: |
+          uname -a
+          git clone -q https://github.com/Kronuz/compressors comp_old && git -C comp_old checkout -q d82b1d8
+          git clone -q https://github.com/Kronuz/compressors comp_new && git -C comp_new checkout -q 9bd24af5a26d999e91ce03da787f5053c7e805fa
+          PFX=""; if [ "$(uname)" = Darwin ]; then PFX="-DCMAKE_PREFIX_PATH=$(brew --prefix)"; fi
+          for v in old new; do
+            cmake -S . -B b_$v -DCMAKE_BUILD_TYPE=Release -DFETCHCONTENT_SOURCE_DIR_COMPRESSORS=$PWD/comp_$v $PFX > /dev/null
+            cmake --build b_$v --target storage_bench -j 4 2>&1 | tail -2
+          done
+      - name: storage_bench, old compressors against new, three rounds
+        run: |
+          for r in 1 2 3; do
+            for v in old new; do echo "== storage $v round $r"; ./b_$v/storage_bench; done
+          done

@@ -17,7 +17,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the bytes it gave before: `storage_path` compares the old loop with the new over every
   string of `a`, `.` and `/` up to length 7 and 20,000 random ones, in all four flag
   combinations, and checks that a relative path never becomes absolute. With the old
-  `storage_fs.h` it fails on every empty-path check.
+  `storage_fs.h` it dies with a segmentation fault at the default-constructed view with
+  `keep_slash` (the `end - 1` loop), the first empty-path check that reaches it.
 
 ### Changed
 

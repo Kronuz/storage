@@ -3,6 +3,20 @@
 All notable changes to `storage` are recorded here, newest first. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-11-01
+
+### Added
+
+- `test/format_golden.cc` and `test/fixtures/`: one volume per codec written by the engine
+  at `e4c5746`, before the 2026-10 changes, from a deterministic record set. The test reads
+  every record back (whole and in 2 KB chunks) and requires the uncompressed volume to be
+  reproduced byte for byte apart from its zero tail. Compressed payload bytes belong to the
+  codec libraries, so those volumes are read, not compared. A writer that stamps the header's
+  reserved field fails it; `test/test.cc` passes that build.
+- `storage_bench` follows its none, LZ4 and zstd scenarios with a raw row: liblz4 or libzstd
+  and `pwrite`/`pread` alone, no framing. The README states the numbers on an Apple M4 Pro
+  and an Intel i9-9980HK: reads are 1.2x to 5.3x slower than the raw floor.
+
 ## 2026-10-31
 
 ### Changed

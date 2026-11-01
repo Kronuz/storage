@@ -1,10 +1,12 @@
 # storage: one volume file. Render: d2 --layout elk --sketch --theme 302 docs/storage.d2 docs/storage.svg
-direction: right
-w: "write(data)\n→ returns the offset" {shape: oval}
+vars: { d2-config: { layout-engine: elk; theme-id: 302; sketch: true; pad: 24 } }
+direction: down
+w: "write(data)\nreturns the offset" {shape: oval}
 volume: "vol.0" {
   grid-columns: 4
-  h: "block 0\nheader\nmagic · txnid · high-water · XXH32"
-  r1: "record\nbin header · data · footer"
+  grid-gap: 40
+  h: "block 0: header\nmagic · txnid\nhigh-water · XXH32"
+  r1: "record\nbin header\ndata · footer"
   r2: "record\n(zstd)"
   free: "fallocated\nfree space" {style.stroke-dash: 3}
 }

@@ -51,37 +51,47 @@ inline std::size_t normalize_path(const char* src, const char* end, char* dst, b
 		*dst++ = '/';
 	}
 	char* const base = dst;  // the output after the root
+	char* floor = base;      // the end of the ".." the output starts with: a ".." pops nothing at or below it
+	// One pass. Each name is copied to `dst` as it is read, behind the '/' that will separate it (written
+	// first; the name's first byte overwrites it when the output is empty), and kept by moving `dst` past
+	// it. An empty name, ".", and a ".." that pops are dropped by leaving `dst` where it was. The output is
+	// never longer than the input read so far, so what is written ahead of `dst` stays inside its bytes.
 	while (src < end) {
-		const char* name = src;
+		*dst = '/';
+		char* const w = dst + (dst > base);
+		char* p = w;
+		const char* const name = src;
 		while (src < end && *src != '/') {
-			++src;
+			*p++ = *src++;
 		}
-		const std::size_t size = static_cast<std::size_t>(src - name);
 		if (src < end) {
 			++src;
 		}
-		if (size == 0 || (size == 1 && name[0] == '.')) {
-			continue;
-		}
-		if (size == 2 && name[0] == '.' && name[1] == '.') {
-			char* last = dst;  // the start of the last component of the output
-			while (last > base && last[-1] != '/') {
-				--last;
-			}
-			if (dst > base && !(dst - last == 2 && last[0] == '.' && last[1] == '.')) {
-				dst = last > base ? last - 1 : base;  // drop it and the '/' before it
+		// '/' is an empty name; '.' a "." or ".." or a name that begins with a dot (any other name is kept).
+		if ((static_cast<unsigned char>(*name) & 0xFE) == 0x2E) {
+			if (*name == '/') {
 				continue;
 			}
-			if (absolute) {
+			const std::size_t size = static_cast<std::size_t>(p - w);
+			if (size == 1) {
 				continue;
 			}
+			if (size == 2 && name[1] == '.') {
+				if (dst > floor) {
+					char* last = dst;  // the start of the last component of the output
+					while (last > floor && last[-1] != '/') {
+						--last;
+					}
+					dst = last > floor ? last - 1 : floor;  // drop it and the '/' before it
+					continue;
+				}
+				if (absolute) {
+					continue;
+				}
+				floor = p;  // a relative path keeps a ".." it cannot pop
+			}
 		}
-		if (dst > base) {
-			*dst++ = '/';
-		}
-		for (std::size_t i = 0; i < size; ++i) {
-			*dst++ = name[i];
-		}
+		dst = p;
 	}
 	if (dst == ret) {
 		*dst++ = '.';
@@ -93,12 +103,19 @@ inline std::size_t normalize_path(const char* src, const char* end, char* dst, b
 }
 
 inline std::string normalize_path(std::string_view src, bool slashed = false, bool keep_slash = false) {
-	std::size_t src_size = src.size();
-	const char* src_str = src.data();
+	const std::size_t size = src.size();
+	const char* const begin = src.data();
+	// A path of a usual size is built on the stack and copied once into a string of its own size: a string
+	// resized to size + 2 and shrunk would be zero-filled, and past the small-string size (15 bytes with
+	// libstdc++) it would allocate for a result that fits in the string.
+	constexpr std::size_t stack_size = 512;
+	if (size + 2 <= stack_size) {
+		char buffer[stack_size];
+		return std::string(buffer, normalize_path(begin, begin + size, buffer, slashed, keep_slash));
+	}
 	std::string dst;
-	dst.resize(src_size + 2);
-	auto dst_size = normalize_path(src_str, src_str + src_size, &dst[0], slashed, keep_slash);
-	dst.resize(dst_size);
+	dst.resize(size + 2);
+	dst.resize(normalize_path(begin, begin + size, &dst[0], slashed, keep_slash));
 	return dst;
 }
 

@@ -40,38 +40,67 @@ inline std::size_t normalize_path(const char* src, const char* end, char* dst, b
 	int levels = 0;
 	char* ret = dst;
 	char ch = '\0';
+	const char* begin = src;
+	// The first component of the output so far is dots only (a leading "." or ".."), and is still open.
+	bool first_dots = true;
+	bool first_open = true;
+	// A ".." popped every component, so the path is "." unless something follows.
+	bool emptied = false;
 	// Visit every byte of [src, end), then the closing '/' of the last component unless keep_slash.
 	// An empty path has no last component, so it gets no closing '/' (that would name the root).
 	// There is no end - 1, so a default-constructed view (a null src) is the empty path.
 	bool closing = !keep_slash && src < end;
 	while (src < end || closing) {
+		bool from_input = true;
 		if (src < end) {
 			ch = *src++;
 		} else {
 			ch = '/';
 			closing = false;
+			from_input = false;
 		}
 		if (ch == '.' && (levels != 0 || dst == ret || *(dst - 1) == '/' )) {
 			*dst++ = ch;
 			++levels;
 		} else if (ch == '/') {
-			while (levels != 0 && dst > ret + 1) {
+			// A ".." pops back to the '/' before the component it removes. The root is never popped,
+			// nor the dots of a leading "." or ".."; the first component of a relative path is popped
+			// like any other, and nothing is left (the path is then "." or what follows).
+			const bool open = dst != ret;
+			char* const floor = open && (*ret == '/' || first_dots) ? ret + 1 : ret;
+			while (levels != 0 && dst > floor) {
 				if (*--dst == '/') {
 					--levels;
 				}
 			}
-			if (dst == ret || *(dst - 1) != '/') {
+			if (open && dst == ret) {
+				levels = 0;
+				emptied = true;
+				first_dots = true;
+				first_open = true;
+			} else if (dst == ret ? (from_input && src == begin + 1) : (*(dst - 1) != '/')) {
 				*dst++ = ch;
+				if (dst - ret > 1) {
+					first_open = false;
+				}
 			}
 		} else {
 			*dst++ = ch;
 			levels = 0;
+			if (first_open && ch != '.') {
+				first_dots = false;
+			}
 		}
 	}
 	if (ch == '.' && levels == 1) {
 		ch = *--dst;
 	}
-	if (dst > ret + 1 && !keep_slash) {
+	if (dst == ret && emptied) {
+		*dst++ = '.';
+		if (slashed || (keep_slash && end[-1] == '/')) {
+			*dst++ = '/';
+		}
+	} else if (dst > ret + 1 && !keep_slash) {
 		if (slashed) {
 			if (ch != '/') {
 				*dst++ = '/';

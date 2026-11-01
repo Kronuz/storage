@@ -7,6 +7,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The vendored `normalize_path` never popped the first component of a relative path
+  (`a/..` was `a`, `a/../b` was `a/b`): the same bug and the same fix as in `fs`. A `..` now
+  pops it like any other component; the result is `.` when nothing is left (`./` with
+  `slashed`). A `Storage` base path of `a/..` is `./`, not `a/`. Oracle:
+  `std::filesystem::path::lexically_normal` where it and the library agree; every input
+  outside the changed class gives the bytes it gave before. `storage_path` compares the old
+  loop with the new, lists the changed class with a model, and checks `a/..`, `a/../b`,
+  `a/b/../..`, and that `a/b/..`, `/a/..` and a leading `..` are as before. With the old
+  `storage_fs.h` it fails.
 - A `Storage` with an empty base path kept `"/"`: the vendored `normalize_path` appended its
   closing `/` to nothing and returned the root, so `Storage("", ...)` opened `"/vol.0"` at the
   root of the filesystem. An empty path now stays empty in every flag combination (oracle:

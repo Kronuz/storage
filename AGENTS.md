@@ -55,17 +55,61 @@ just resolve.
   instantiation without touching call sites (Xapiand uses this).
 - **Keep it ASAN/TSAN clean.** The engine has no shared/static state (the
   in-tree static fsyncher is gone). The concurrency test guards that; run the
-  ASAN and TSAN builds (Homebrew LLVM) after engine changes.
+  ASan and TSan builds (below) after engine changes.
 
 ## Build / test
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ctest --test-dir build && ./build/storage_bench
-# sanitizers (Homebrew LLVM):
-cmake -B build-asan -DCMAKE_CXX_FLAGS="-fsanitize=address -g" && cmake --build build-asan && ./build-asan/storage_test
-cmake -B build-tsan -DCMAKE_CXX_FLAGS="-fsanitize=thread  -g" && cmake --build build-tsan && ./build-tsan/storage_test
 ```
+
+Sanitizers, fuzzing and the benchmark are in the next section.
+
+## Verification and benchmarks
+
+The method shared by the Kronuz libraries is in
+[docs/PERFORMANCE.md](https://github.com/Kronuz/cpp-libraries/blob/main/docs/PERFORMANCE.md).
+
+- **Tests.** `ctest` runs ten tests. Oracles: `storage_format_golden` reads the volumes in
+  `test/fixtures/` (written by the engine at `e4c5746`) and reproduces the uncompressed one byte
+  for byte; `storage_crash` and `storage_stream` replay power loss through `test/crashio.h`;
+  `storage_path` checks the path normalizer against a model and the digest of Python's
+  `os.path.normpath` over every string of `a`, `b`, `.` and `/` up to 8 bytes.
+- **Sanitizers.** CI (`.github/workflows/ci.yml`, which calls the shared
+  [cmake.yml](https://github.com/Kronuz/cpp-libraries/blob/main/.github/workflows/cmake.yml))
+  runs every test under ASan+UBSan and under TSan (`storage` has an 8-thread case), clang on Linux:
+
+  ```sh
+  CC=clang CXX=clang++ cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -D_GLIBCXX_ASSERTIONS" \
+    -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+  cmake --build build-asan && ASAN_OPTIONS=detect_leaks=1 ctest --test-dir build-asan --output-on-failure
+  CC=clang CXX=clang++ cmake -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g -fsanitize=thread -fno-omit-frame-pointer" \
+    -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+  cmake --build build-tsan && TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1" ctest --test-dir build-tsan --output-on-failure
+  ```
+
+- **Fuzzing.** `-DSTORAGE_FUZZ=ON`, with a clang that has libFuzzer, builds `storage_fuzz`
+  (`fuzz/fuzz_stream.cc`: stream a record, flip a byte of the volume, reopen) and the CTest test
+  `storage_fuzz_replay`, which runs the seeds in `fuzz/corpus/` (`s8` is the LZ4 bounds
+  regression). Keep new inputs apart from the seeds:
+  `./build-fuzz/storage_fuzz -max_total_time=600 new-corpus/ fuzz/corpus/`.
+- **Benchmark.** `storage_bench` (`examples/bench.cc`, built with the tests, no option) prints
+  write and read MB/s and the compression ratio per codec, each none, LZ4 and zstd row followed
+  by a raw floor (the codec and `pwrite`/`pread` alone). Numbers and machines:
+  `docs/perf/README.md`. To compare two commits, build it at each and run both with
+  `tools/ab_compare.py` from a clone of [cpp-libraries](https://github.com/Kronuz/cpp-libraries)
+  beside this one; it runs A, B and A again (the A/A control) every round, and `--column 2` reads
+  the read MB/s (`--column 1` the write):
+
+  ```sh
+  git worktree add ../storage-base BASE_COMMIT
+  cmake -S ../storage-base -B build-base -DCMAKE_BUILD_TYPE=Release && cmake --build build-base --target storage_bench
+  python3 ../cpp-libraries/tools/ab_compare.py run --rounds 7 --format table --column 2 --higher-better \
+    build-base/storage_bench build/storage_bench
+  ```
 
 ## Codecs
 

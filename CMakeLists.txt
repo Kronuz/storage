@@ -27,7 +27,7 @@ endif()
 FetchContent_Declare(compressors GIT_REPOSITORY https://github.com/Kronuz/compressors.git GIT_TAG fe0e7127512ac14c57e9083733dcd48d2b701de8)
 FetchContent_Declare(errno_names GIT_REPOSITORY https://github.com/Kronuz/errno-names.git GIT_TAG 73b74938b3a455423cdf4c0039372dc1fe3b71c7)
 FetchContent_Declare(strict_stox GIT_REPOSITORY https://github.com/Kronuz/strict-stox.git GIT_TAG 5d979797b9799afcdacc0c004c229e2d61af1341)
-FetchContent_Declare(stringified GIT_REPOSITORY https://github.com/Kronuz/stringified.git GIT_TAG 2c78a1dcd97d056349700af46e502c85074c6561)
+FetchContent_Declare(stringified GIT_REPOSITORY https://github.com/Kronuz/stringified.git GIT_TAG 0053465ae99fb0f344f3c7a16dc88b4ec473ceb0)
 FetchContent_MakeAvailable(compressors errno_names strict_stox stringified)
 
 # --- Library target (header-only) ---

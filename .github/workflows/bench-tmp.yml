@@ -33,3 +33,10 @@ jobs:
           for r in 1 2 3; do
             for v in old new; do echo "== storage $v round $r"; ./b_$v/storage_bench; done
           done
+      - name: storage_bench with glibc trimming off (Linux only), old against new
+        if: runner.os == 'Linux'
+        run: |
+          export MALLOC_TRIM_THRESHOLD_=4294967295 MALLOC_TOP_PAD_=67108864
+          for r in 1 2; do
+            for v in old new; do echo "== storage notrim $v round $r"; ./b_$v/storage_bench; done
+          done

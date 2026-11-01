@@ -191,6 +191,16 @@ inline std::string storage_decompress(uint8_t codec, std::string_view data) {
 	}
 }
 
+// The same into `out`, which a reader keeps from record to record: zstd decodes into its
+// capacity, so a steady stream of reads allocates nothing for the record.
+inline void storage_decompress(uint8_t codec, std::string_view data, std::string& out) {
+	if (codec == STORAGE_CODEC_ZSTD) {
+		decompress_zstd(data, out);
+	} else {
+		out = storage_decompress(codec, data);
+	}
+}
+
 // The codec to write a record with, given the open flags; -1 = no compression.
 // If several are set, Zstandard (the default) wins, then Deflate, then LZ4.
 inline int storage_write_codec(int flags) {
@@ -1099,7 +1109,7 @@ public:
 				}
 				bin_offset += bin_header.size;
 				try {
-					_record = storage_decompress(codec, std::string_view(payload.data(), payload.size()));
+					storage_decompress(codec, std::string_view(payload.data(), payload.size()), _record);
 				} catch (const StorageException&) {
 					throw;
 				} catch (const Error&) {

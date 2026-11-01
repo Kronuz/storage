@@ -7,6 +7,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The compressors pin moves to `40221d2` (`9bd24af` and the zstd decode into a string).
+  A zstd record is decoded into the reader's own `_record`, which keeps its capacity from
+  record to record, so a read allocates nothing for the record. The returning decode
+  allocated a fresh 1 MB string per record, and under glibc's default trim threshold the
+  freed top of the heap went back to the kernel and was faulted in again: the 1 MB zstd
+  read ran at 430-450 MB/s against 740 before `9bd24af`. It reads at 710-750 MB/s now
+  (Linux x86_64 runner, `storage_bench`).
 - The compressors pin moves to `9bd24af`. Its XXH32 computes the same digest on every
   host byte order (storage still writes its header, footer and record structs in host
   order, so a volume is not yet portable across byte orders). Its XXH32 is 2-6x faster

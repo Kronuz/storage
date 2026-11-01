@@ -72,8 +72,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_compile_definitions(storage_test_nolegacy PRIVATE STORAGE_LEGACY_SUPPORT=0)
 	add_test(NAME storage_nolegacy COMMAND storage_test_nolegacy)
 
-	# The base path normalizer: an empty path stays empty (a Storage with no base path opens its
-	# volumes in the working directory, not at the root), everything else equals the frozen loop.
+	# The base path normalizer: os.path.normpath's form, with the current directory "." even for the
+	# empty path (a Storage with no base path opens its volumes in the working directory, not at the root).
 	add_executable(storage_test_path test/test_path.cc)
 	target_link_libraries(storage_test_path PRIVATE storage)
 	add_test(NAME storage_path COMMAND storage_test_path)

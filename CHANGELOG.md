@@ -7,27 +7,24 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- The vendored `normalize_path` never popped the first component of a relative path
-  (`a/..` was `a`, `a/../b` was `a/b`): the same bug and the same fix as in `fs`. A `..` now
-  pops it like any other component; the result is `.` when nothing is left (`./` with
-  `slashed`). A `Storage` base path of `a/..` is `./`, not `a/`. Oracle:
-  `std::filesystem::path::lexically_normal` where it and the library agree; every input
-  outside the changed class gives the bytes it gave before. `storage_path` compares the old
-  loop with the new, lists the changed class with a model, and checks `a/..`, `a/../b`,
-  `a/b/../..`, and that `a/b/..`, `/a/..` and a leading `..` are as before. With the old
-  `storage_fs.h` it fails.
-- A `Storage` with an empty base path kept `"/"`: the vendored `normalize_path` appended its
-  closing `/` to nothing and returned the root, so `Storage("", ...)` opened `"/vol.0"` at the
-  root of the filesystem. An empty path now stays empty in every flag combination (oracle:
-  `std::filesystem::path::lexically_normal`, which maps `""` to `""`), so the volumes open
-  relative to the working directory. A default-constructed view gives the same result. The
-  loop no longer forms `end - 1`, which wrapped around for an empty view with `keep_slash`
-  (the engine passes `slashed` only). The same fix is in `fs`. Every non-empty input gives
-  the bytes it gave before: `storage_path` compares the old loop with the new over every
-  string of `a`, `.` and `/` up to length 7 and 20,000 random ones, in all four flag
-  combinations, and checks that a relative path never becomes absolute. With the old
-  `storage_fs.h` it dies with a segmentation fault at the default-constructed view with
-  `keep_slash` (the `end - 1` loop), the first empty-path check that reaches it.
+- The vendored `normalize_path` returns the lexical normal form of Python's `os.path.normpath`,
+  and the current directory has one spelling, `.`: the same change as in `fs`, which carries
+  the same function. Before, the empty path was `/` (the closing `/` appended to nothing, so
+  `Storage("", ...)` opened `/vol.0` at the root of the filesystem), `.` with `keep_slash`
+  was `""`, and `x/..` was `x`: the pop loop never removed the first component of a relative
+  path (`a/../b` was `a/b`). `""`, `.`, `./`, `x/..`, `x/../`, `./x/..` are now `.` (`./` with
+  `slashed`), so a `Storage` with an empty, `.` or `a/..` base path keeps `./` and opens its
+  volumes as `./vol.0` in the working directory; `""` is not a path that `open` or `stat`
+  accepts. A `..` also removes the first component (`a/../b` is `b`), a relative path keeps
+  the `..` it cannot remove (`../x` stays `../x`), the root absorbs it (`/..` is `/`), a
+  leading `./` is dropped, and a component of three or more dots is a name. A run of leading
+  `/` is one root (`//x` is `/x`; `os.path.normpath` keeps two). A default-constructed view is
+  the empty path. `storage_path` checks a stack-of-components model against the function over
+  every string of `a`, `b`, `.` and `/` up to length 8 and 20,000 random ones in all four flag
+  combinations, that a second normalization changes nothing, that the results over the 87,380
+  exhaustive strings hash to the digest of `os.path.normpath`'s own results, a table of named
+  inputs, the `Storage` base path for each spelling, and that every non-empty input without a
+  `.` gives the bytes the old loop gave. With the old `storage_fs.h` it fails.
 
 ### Changed
 

@@ -7,6 +7,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The compressors pin moves to `fe0e712` (`40221d2` and the returned zstd string built
+  with its constructor, which is 2x faster for a 64 KB frame on Apple M4).
 - The compressors pin moves to `40221d2` (`9bd24af` and the zstd decode into a string).
   A zstd record is decoded into the reader's own `_record`, which keeps its capacity from
   record to record, so a read allocates nothing for the record. The returning decode

@@ -57,21 +57,21 @@ inline std::size_t normalize_path(const char* src, const char* end, char* dst, b
 	// it. An empty name, ".", and a ".." that pops are dropped by leaving `dst` where it was. The output is
 	// never longer than the input read so far, so what is written ahead of `dst` stays inside its bytes.
 	while (src < end) {
+		if (*src == '/') {  // an empty name
+			++src;
+			continue;
+		}
 		*dst = '/';
 		char* const w = dst + (dst > base);
 		char* p = w;
 		const char* const name = src;
-		while (src < end && *src != '/') {
+		do {
 			*p++ = *src++;
-		}
+		} while (src < end && *src != '/');
 		if (src < end) {
 			++src;
 		}
-		// '/' is an empty name; '.' a "." or ".." or a name that begins with a dot (any other name is kept).
-		if ((static_cast<unsigned char>(*name) & 0xFE) == 0x2E) {
-			if (*name == '/') {
-				continue;
-			}
+		if (*name == '.') {  // ".", "..", or a name that begins with a dot (any other name is kept)
 			const std::size_t size = static_cast<std::size_t>(p - w);
 			if (size == 1) {
 				continue;
@@ -88,7 +88,8 @@ inline std::size_t normalize_path(const char* src, const char* end, char* dst, b
 				if (absolute) {
 					continue;
 				}
-				floor = p;  // a relative path keeps a ".." it cannot pop
+				dst = floor = p;  // a relative path keeps a ".." it cannot pop
+				continue;
 			}
 		}
 		dst = p;

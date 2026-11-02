@@ -28,6 +28,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The vendored `normalize_path` follows the fs library's one pass (fs `CHANGELOG.md`, 2026-11-01): each
+  name is copied to the output as it is read and kept or dropped at its `/`, a `..` that pops no longer
+  scans back over a `..` prefix, and the string overload builds a path of up to 510 bytes on the stack and
+  copies it once. The bytes are the same as the loop of 8934dbc on every input: `test/test_path.cc`
+  compares them in all four flag combinations over every string of `/`, `.`, `a`, `b` up to length 10 and
+  of `/`, `.`, `a` up to length 12, 800,000 random strings of names and of bytes, and every path length from 0
+  to 600, on exact-size heap blocks. A `Storage` calls it once, in its constructor, so the gain is the
+  library's: on the fs bench (the same loop, M4 Pro and i9) the loop is 1.1x to 1.9x faster than at START
+  on 12 of its 14 rows on the M4 and on all 14 on the i9; `np_keep_slash` ties on the M4 and `a/b/c/d` is
+  0.92x of START there (fs issue #1).
+
 - `Storage::read()` (a whole record) sizes its result once, from the record, and fills it in
   place: a compressed record is decoded straight into the result and an uncompressed one is
   read straight into it. `cc36919` had made the result grow by doubling `resize` and copy the

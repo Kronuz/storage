@@ -36,7 +36,21 @@ static int failures = 0;
 
 
 // ---- Allocation accounting: the bytes of the allocations of at least 4 KB while it is on ----
+// ThreadSanitizer's runtime defines operator new itself, and a second definition does not link:
+// the accounting, and the test that reads it, are left out there.
 
+#if defined(__SANITIZE_THREAD__)
+#define STORAGE_TEST_COUNT_ALLOC 0
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define STORAGE_TEST_COUNT_ALLOC 0
+#endif
+#endif
+#ifndef STORAGE_TEST_COUNT_ALLOC
+#define STORAGE_TEST_COUNT_ALLOC 1
+#endif
+
+#if STORAGE_TEST_COUNT_ALLOC
 static std::atomic<bool> g_count_on{false};
 static std::atomic<size_t> g_big_bytes{0};
 static std::atomic<size_t> g_big_allocs{0};
@@ -57,6 +71,7 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, size_t) noexcept { std::free(p); }
 void operator delete[](void* p, size_t) noexcept { std::free(p); }
+#endif  // STORAGE_TEST_COUNT_ALLOC
 
 
 #pragma pack(push, 1)
@@ -279,6 +294,7 @@ static void test_damage(const std::string& base) {
 }
 
 
+#if STORAGE_TEST_COUNT_ALLOC
 // The bytes (in allocations of 4 KB or more) that f() allocates.
 template <class F>
 static size_t allocated_by(F&& f) {
@@ -330,6 +346,11 @@ static void test_allocation(const std::string& base) {
 		r.close();
 	}
 }
+#else
+static void test_allocation(const std::string&) {
+	std::printf("allocation test skipped: the thread sanitizer defines operator new\n");
+}
+#endif
 
 
 int main() {

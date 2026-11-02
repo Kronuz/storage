@@ -28,7 +28,7 @@ endif()
 #   stringified -> stringified                                (stringified.hh)
 FetchContent_Declare(compressors GIT_REPOSITORY https://github.com/Kronuz/compressors.git GIT_TAG 94a37588ba84ec6409e19d9e7352e36ca2ae7210)
 FetchContent_Declare(errno_names GIT_REPOSITORY https://github.com/Kronuz/errno-names.git GIT_TAG 0ec0801ff7b4d32412d33b2c7e041c6b55f38d14)
-FetchContent_Declare(strict_stox GIT_REPOSITORY https://github.com/Kronuz/strict-stox.git GIT_TAG c1c9bc1283cc9f0c6b4c1b45ff0215ff78953b36)
+FetchContent_Declare(strict_stox GIT_REPOSITORY https://github.com/Kronuz/strict-stox.git GIT_TAG dc24d9f68eb68992c85a1fa10f3ce5480b7e2ec7)
 FetchContent_Declare(stringified GIT_REPOSITORY https://github.com/Kronuz/stringified.git GIT_TAG 47a0bb6fef17f17ce5d5ca563f4cbf020dff29bc)
 FetchContent_MakeAvailable(compressors errno_names strict_stox stringified)
 

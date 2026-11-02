@@ -28,6 +28,31 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `Storage::read()` (a whole record) sizes its result once, from the record, and fills it in
+  place: a compressed record is decoded straight into the result and an uncompressed one is
+  read straight into it. `cc36919` had made the result grow by doubling `resize` and copy the
+  decoded record in; each doubling zero-filled the new capacity (the last one, for a 1 MiB record,
+  1 MiB of pages the read never touched), so a whole read of a compressed record was slower than
+  before that commit on the i9 (0.66x lz4, 0.72x zstd, 0.75x deflate of START). A whole read of a
+  1 MiB record now allocates the record's size, plus the compressed payload and what the codec
+  needs: 1.05 MB (none), 1.69 (lz4), 1.22 (zstd), 2.27 (deflate), against 4.21, 5.89, 4.38 and
+  6.48 MB. Reading 1 MiB records whole, ns per MiB (best of three rounds of 60 records, START
+  `7b9abd1` / `0c19966` / now), Apple M4 Pro: none 338579 / 186992 / 146610, lz4 464940 / 453312 /
+  404462, zstd 764114 / 748457 / 696613, deflate 519833 / 506242 / 456995; Intel i9-9980HK: none
+  1009832 / 808666 / 305434, lz4 929661 / 1401993 / 591983, zstd 1198584 / 1672803 / 988217,
+  deflate 1458653 / 1942153 / 1060176. Reading in 2 KB chunks, and the format, are unchanged.
+  A record whose chunks a caller began to read is finished in chunks as before. The read is
+  split into `begin_record`, `decompress_record` and `end_record`, which the chunked read
+  uses too, so both end a damaged record with the same exception and message; a payload
+  is read in pieces of at most 1 GiB (macOS refuses a larger count).
+- The cost of `217e731` on the M4 is a second flush: `commit()` fsyncs the volume directory
+  once after it created the file, between the data sync and the header write, so a record a
+  commit acknowledged cannot vanish with its directory entry. On APFS that is 17 to 35 ms per
+  new volume: the "small blobs" write rows (50000 x 256 B into a fresh 12 MB volume) took
+  4.0 to 4.4 ms per MB without it and 7.8 to 8.4 with it (median of 15 volumes, two runs, Apple M4
+  Pro; 0.70 to 0.92 of START in the gate), and 200 MiB volumes do not show it. Syncing the
+  directory before the data sync instead (5.2 to 7.1) does not cut it; the durability fix stays. It is done only for a volume the storage created and only once, so a
+  volume that exists pays nothing.
 - The comment in `CMakeLists.txt` said that LZ4 is the only codec, and that zstd and deflate are
   a follow-up. A record is stored raw or with LZ4, Zstandard (the default) or Deflate; the codec
   id is in the bin-header flags (`storage.h`), and the comment and the dependency note
@@ -38,6 +63,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `test/test_read.cc` (CTest `storage_read`): a whole `read()` against the chunked read and the
+  data for every codec and sizes from 0 to 3 MiB + 7 around the 2 KB chunk, the compression
+  threshold and the MiB, text and random bytes; a record read part way by chunks and finished
+  whole; the records in sequence up to EOF; damaged volumes (a flipped payload, size, flags or
+  footer byte, a truncation in the header, payload or footer) that end the same way either way,
+  with the same exception and message; and a counting `operator new` that bounds what a whole
+  read allocates by what the codec's own decode and the payload need (the test fails with
+  `cc36919`'s read: 4 failures, 4.2 to 6.5 MB for a 1 MiB record).
 - `test/format_golden.cc` and `test/fixtures/`: one volume per codec written by the engine
   at `e4c5746`, before the 2026-10 changes, from a deterministic record set. The test reads
   every record back (whole and in 2 KB chunks) and requires the uncompressed volume to be

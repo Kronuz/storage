@@ -1050,6 +1050,102 @@ public:
 		return write(contents.data(), contents.size(), args);
 	}
 
+	// A read's I/O failure: the volume is closed and the error surfaces as StorageIOError.
+	[[noreturn]] void read_failed() {
+		close();
+		L_ERR("IO error in {}: read: {} ({}): {}", repr(path.empty() ? base_path : path), error::name(errno), errno, error::description(errno));
+		THROW(StorageIOError, error::description(errno));
+	}
+
+	// Starts the record at bin_offset: reads and validates its bin header and checks its size
+	// against the volume.
+	void begin_record(uint32_t limit, void* args) {
+		off_t offset = IO::lseek(fd, bin_offset, SEEK_SET);
+		if (offset >= static_cast<off_t>(hw_offset) * STORAGE_ALIGNMENT || offset >= static_cast<off_t>(limit) * STORAGE_ALIGNMENT) {
+			THROW(StorageEOF, "Storage EOF");
+		}
+
+		auto read_size = IO::read(fd, &bin_header, sizeof(StorageBinHeader));
+		if unlikely(read_size == -1) {
+			read_failed();
+		} else if unlikely(read_size != sizeof(StorageBinHeader)) {
+			THROW(StorageCorruptVolume, "Incomplete bin header");
+		}
+		bin_offset += read_size;
+		bin_header.validate(param, args);
+
+		// Guard the size field before trusting it for I/O or allocation. A
+		// record's payload plus its footer can never extend past the volume's
+		// committed high-water mark (hw_offset, counted in STORAGE_ALIGNMENT
+		// units -- the same bound seek()/EOF use). The bin header is not
+		// checksummed, so a single flipped byte can turn `size` into ~4 GB;
+		// without this check the payload.resize(size) on the compressed path
+		// would attempt a multi-gigabyte allocation, turning a corrupt
+		// volume into an OOM / std::bad_alloc instead of a clean, catchable
+		// StorageCorruptVolume. The bound also caps the uncompressed read loop.
+		// It is computed from in-memory state (zero syscalls) and never rejects
+		// a valid record (hw_offset is always rounded up past the last footer).
+		if (static_cast<uint64_t>(bin_offset) + bin_header.size + sizeof(StorageBinFooter)
+				> hw_offset * STORAGE_ALIGNMENT) {
+			THROW(StorageCorruptVolume, "Bin size exceeds volume bounds");
+		}
+
+		IO::fadvise(fd, bin_offset, bin_header.size, POSIX_FADV_WILLNEED);
+	}
+
+	// The next `size` bytes of the record into `dst`, in reads of at most 1 GiB (macOS refuses a
+	// larger count). The record's bytes must all be there: fewer is a corrupt volume.
+	void read_fully(char* dst, size_t size) {
+		constexpr size_t max_read = size_t(1) << 30;
+		for (size_t done = 0; done < size;) {
+			size_t n = std::min(size - done, max_read);
+			auto read_size = IO::read(fd, dst + done, n);
+			if unlikely(read_size == -1) {
+				read_failed();
+			} else if unlikely(static_cast<size_t>(read_size) != n) {
+				THROW(StorageCorruptVolume, "Incomplete bin data");
+			}
+			bin_offset += read_size;
+			done += n;
+		}
+	}
+
+	// The compressed record's payload, which follows its bin header, decompressed into `out`.
+	// The codec rides in the bin-header flags (legacy volumes wrote LZ4 = codec 0).
+	void decompress_record(std::string& out) {
+		uint8_t codec = (bin_header.flags & STORAGE_CODEC_MASK) >> STORAGE_CODEC_SHIFT;
+		std::string payload;
+		payload.resize(bin_header.size);
+		read_fully(payload.data(), payload.size());
+		try {
+			storage_decompress(codec, std::string_view(payload.data(), payload.size()), out);
+		} catch (const StorageException&) {
+			throw;
+		} catch (const Error&) {
+			// A damaged payload fails in the codec; the contract is a Storage* exception.
+			THROW(StorageCorruptVolume, "Cannot decompress bin");
+		}
+	}
+
+	// Ends the record being read: its footer is read and checked against `hash`, the XXH32 of the
+	// record's (decompressed) bytes, and the cursor moves to the next record.
+	void end_record(uint32_t hash, void* args) {
+		auto read_size = IO::read(fd, &bin_footer, sizeof(StorageBinFooter));
+		if unlikely(read_size == -1) {
+			read_failed();
+		} else if unlikely(read_size != sizeof(StorageBinFooter)) {
+			THROW(StorageCorruptVolume, "Incomplete bin footer");
+		}
+		bin_offset += read_size;
+		bin_footer.validate(param, args, hash);
+
+		// Align the bin_offset to the next storage alignment
+		bin_offset = ((bin_offset + STORAGE_ALIGNMENT - 1) / STORAGE_ALIGNMENT) * STORAGE_ALIGNMENT;
+
+		bin_header.size = 0;
+		bin_size = 0;
+	}
+
 	size_t read(char* buf, size_t buf_size, uint32_t limit=-1, void* args=nullptr) {
 		L_CALL("Storage::read() [1]");
 
@@ -1058,64 +1154,12 @@ public:
 		}
 
 		if (!bin_header.size) {
-			off_t offset = IO::lseek(fd, bin_offset, SEEK_SET);
-			if (offset >= static_cast<off_t>(hw_offset) * STORAGE_ALIGNMENT || offset >= static_cast<off_t>(limit) * STORAGE_ALIGNMENT) {
-				THROW(StorageEOF, "Storage EOF");
-			}
-
-			auto read_size = IO::read(fd, &bin_header, sizeof(StorageBinHeader));
-			if unlikely(read_size == -1) {
-				close();
-				L_ERR("IO error in {}: read: {} ({}): {}", repr(path.empty() ? base_path : path), error::name(errno), errno, error::description(errno));
-				THROW(StorageIOError, error::description(errno));
-			} else if unlikely(read_size != sizeof(StorageBinHeader)) {
-				THROW(StorageCorruptVolume, "Incomplete bin header");
-			}
-			bin_offset += read_size;
-			bin_header.validate(param, args);
-
-			// Guard the size field before trusting it for I/O or allocation. A
-			// record's payload plus its footer can never extend past the volume's
-			// committed high-water mark (hw_offset, counted in STORAGE_ALIGNMENT
-			// units -- the same bound seek()/EOF use). The bin header is not
-			// checksummed, so a single flipped byte can turn `size` into ~4 GB;
-			// without this check the payload.resize(size) on the compressed path
-			// below would attempt a multi-gigabyte allocation, turning a corrupt
-			// volume into an OOM / std::bad_alloc instead of a clean, catchable
-			// StorageCorruptVolume. The bound also caps the uncompressed read loop.
-			// It is computed from in-memory state (zero syscalls) and never rejects
-			// a valid record (hw_offset is always rounded up past the last footer).
-			if (static_cast<uint64_t>(bin_offset) + bin_header.size + sizeof(StorageBinFooter)
-					> hw_offset * STORAGE_ALIGNMENT) {
-				THROW(StorageCorruptVolume, "Bin size exceeds volume bounds");
-			}
-
-			IO::fadvise(fd, bin_offset, bin_header.size, POSIX_FADV_WILLNEED);
+			begin_record(limit, args);
 
 			if (bin_header.flags & STORAGE_FLAG_COMPRESSED) {
 				// Read the whole compressed payload and decompress it once; the
-				// chunks are served from _record below. The codec rides in the
-				// bin-header flags (legacy volumes wrote LZ4 = codec 0).
-				uint8_t codec = (bin_header.flags & STORAGE_CODEC_MASK) >> STORAGE_CODEC_SHIFT;
-				std::string payload;
-				payload.resize(bin_header.size);
-				auto payload_read = IO::read(fd, payload.data(), bin_header.size);
-				if unlikely(payload_read == -1) {
-					close();
-					L_ERR("IO error in {}: read: {} ({}): {}", repr(path.empty() ? base_path : path), error::name(errno), errno, error::description(errno));
-					THROW(StorageIOError, error::description(errno));
-				} else if unlikely(static_cast<size_t>(payload_read) != bin_header.size) {
-					THROW(StorageCorruptVolume, "Incomplete bin data");
-				}
-				bin_offset += bin_header.size;
-				try {
-					storage_decompress(codec, std::string_view(payload.data(), payload.size()), _record);
-				} catch (const StorageException&) {
-					throw;
-				} catch (const Error&) {
-					// A damaged payload fails in the codec; the contract is a Storage* exception.
-					THROW(StorageCorruptVolume, "Cannot decompress bin");
-				}
+				// chunks are served from _record below.
+				decompress_record(_record);
 				_record_offset = 0;
 			} else {
 				compressors::XXH32_reset(&xxh_state, STORAGE_CHECKSUM_SEED);
@@ -1141,9 +1185,7 @@ public:
 			if (buf_size) {
 				auto read_size = IO::read(fd, buf, buf_size);
 				if unlikely(read_size == -1) {
-					close();
-					L_ERR("IO error in {}: read: {} ({}): {}", repr(path.empty() ? base_path : path), error::name(errno), errno, error::description(errno));
-					THROW(StorageIOError, error::description(errno));
+					read_failed();
 				} else if unlikely(static_cast<size_t>(read_size) != buf_size) {
 					THROW(StorageCorruptVolume, "Incomplete bin data");
 				}
@@ -1155,22 +1197,7 @@ public:
 			bin_hash = compressors::XXH32_digest(&xxh_state);
 		}
 
-		auto read_size = IO::read(fd, &bin_footer, sizeof(StorageBinFooter));
-		if unlikely(read_size == -1) {
-			close();
-			L_ERR("IO error in {}: read: {} ({}): {}", repr(path.empty() ? base_path : path), error::name(errno), errno, error::description(errno));
-			THROW(StorageIOError, error::description(errno));
-		} else if unlikely(read_size != sizeof(StorageBinFooter)) {
-			THROW(StorageCorruptVolume, "Incomplete bin footer");
-		}
-		bin_offset += read_size;
-		bin_footer.validate(param, args, bin_hash);
-
-		// Align the bin_offset to the next storage alignment
-		bin_offset = ((bin_offset + STORAGE_ALIGNMENT - 1) / STORAGE_ALIGNMENT) * STORAGE_ALIGNMENT;
-
-		bin_header.size = 0;
-		bin_size = 0;
+		end_record(bin_hash, args);
 
 		return 0;
 	}
@@ -1642,33 +1669,34 @@ public:
 	std::string read(uint32_t limit=-1, void* args=nullptr) {
 		L_CALL("Storage::read() [2]");
 
-		// A small record is one chunk from the stack. A larger one is read straight into the
-		// result, which doubles as it fills: a compressed record is served from its
-		// decompressed copy in one memcpy per doubling, instead of a string per 2 KB chunk.
-		char buf[LZ4_BLOCK_SIZE];
-		auto read_size = read(buf, sizeof(buf), limit, args);
-		std::string ret(buf, read_size);
-		if (read_size) {
-			// The next read is the one that returns 0 once the record is done (and checks its footer).
-			read_size = read(buf, sizeof(buf), limit, args);
-			if (read_size) {
-				size_t len = ret.size();
-				ret.append(buf, read_size);
-				len += read_size;
-				for (;;) {
-					if (ret.size() - len < LZ4_BLOCK_SIZE) {
-						ret.resize(ret.size() * 2);
-					}
-					read_size = read(ret.data() + len, ret.size() - len, limit, args);
-					if (!read_size) {
-						break;
-					}
-					len += read_size;
-				}
-				ret.resize(len);
+		std::string ret;
+
+		if (!bin_header.size) {
+			// A whole record at its start: the result is sized once, from the record's own size,
+			// and filled in place. A compressed record is decoded straight into the result and an
+			// uncompressed one is read straight into it, with no chunk in between and no growth.
+			begin_record(limit, args);
+
+			if (bin_header.flags & STORAGE_FLAG_COMPRESSED) {
+				decompress_record(ret);
+				bin_hash = xxh32_oneshot(ret.data(), ret.size(), STORAGE_CHECKSUM_SEED);
+			} else {
+				ret.resize(bin_header.size);
+				read_fully(ret.data(), ret.size());
+				bin_size += ret.size();
+				bin_hash = xxh32_oneshot(ret.data(), ret.size(), STORAGE_CHECKSUM_SEED);
 			}
+
+			end_record(bin_hash, args);
+			return ret;
 		}
 
+		// A record whose chunks a caller began to read: the rest of it, chunk by chunk.
+		ret.reserve(bin_header.flags & STORAGE_FLAG_COMPRESSED ? _record.size() - _record_offset : bin_header.size - bin_size);
+		char buf[LZ4_BLOCK_SIZE];
+		while (auto read_size = read(buf, sizeof(buf), limit, args)) {
+			ret.append(buf, read_size);
+		}
 		return ret;
 	}
 

@@ -78,6 +78,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(storage_test_path PRIVATE storage)
 	add_test(NAME storage_path COMMAND storage_test_path)
 
+	# The read path: a whole read() against the chunked read(buf, size) and the data, every codec and
+	# sizes around the chunk and the MiB; damaged volumes end alike either way; a whole read allocates
+	# its result once.
+	add_executable(storage_test_read test/test_read.cc)
+	target_link_libraries(storage_test_read PRIVATE storage)
+	add_test(NAME storage_read COMMAND storage_test_read)
+
 	# Crash-consistency + corruption matrix for the v2 format, driven through an
 	# in-memory write-logging IO policy (simulated power loss).
 	add_executable(storage_test_crash test/test_crash.cc)

@@ -128,6 +128,8 @@ deflate, and the run-to-run spread.
 
 ## 📚 Documentation
 
+- [Append Only](https://kronuz.github.io/blog/storage/):
+  the Familiars post on why it exists and how it works.
 - [ARCHITECTURE.md](ARCHITECTURE.md): on-disk layout, write and read paths, durability
   and failure modes.
 - [docs/INTEGRATION.md](docs/INTEGRATION.md): the IO policy, the async-fsync hook, and
